@@ -20,7 +20,7 @@ An interactive spline curve editor featuring drag-and-drop manipulation and batc
 ## 🔬 科研利器 / Scientific Powerhouse
 
 在学术研究与工程实验中，原始采集的数据往往伴随噪声、异常点，通过编写代码不断调参往往效率低下。本项目是**科研人员不可或缺的曲线微调与仿真神器**：
-* **快速调校，即刻保存 (Rapid Tuning & Local Saving):** 彻底告别“修改代码-运行查看-再修改”的低效循环。通过鼠标直观拖拽，即可完成对复杂曲线的毫秒级修正，并支持将拖动修改后的原始数据保存到本地，让数据调整在眨眼间完成。
+* **快速调校，即刻保存 (Rapid Tuning & Local Saving):** 彻底告别“修改代码-运行查看-再修改”的低效循环。通过鼠标直观拖拽，即可完成对复杂曲线的毫秒级修正，`并支持将拖动修改后的原始数据保存到本地`，让数据调整在眨眼间完成。
 * **数据去噪与平滑 (Data Denoising):** 摆脱盲目的调参，通过肉眼可见的平滑样条（Spline）直接剔除异常野点。
 * **物理轨迹规划 (Trajectory Planning):** 完美适用于机器人路径规划、自动驾驶控制算法的控制点（Anchor Points）快速生成与动态微调。
 * **实验数据实时拟合 (In-place Fitting):** 无缝替换原始实验矩阵，修改即刻生效，助你快速调校出最符合理论预期的完美曲线。
