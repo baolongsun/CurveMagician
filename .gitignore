@@ -1,5 +1,9 @@
 # VSCode 本地配置，不上传
 .vscode/
+.claude
+package-lock.json
+package.json
+main_v2.py
 
 # SSH 密钥文件，绝对不能上传！
 git_passwd
