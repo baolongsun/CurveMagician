@@ -17,7 +17,7 @@ try:
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
-    print("提示: 安装 pandas 可支持 CSV/Excel 格式 (pip install pandas openpyxl)")
+    print("提示: 安装 pandas + openpyxl 可支持 CSV/Excel 格式 (pip install pandas openpyxl)")
 
 # 可选依赖：tkinterdnd2 用于文件拖拽
 try:
@@ -87,6 +87,7 @@ class HarmoniousCurvesEditor:
         self._in_continuous_drag = False
         self._slider_base_state = None
         self._is_sliding = False  # 标记当前是否正在拖动滑杆
+        self._noise_seed = None   # 单次拖拽缓存噪点种子，松手后重置
 
         # 组件引用初始化
         self.radio_menu = None
@@ -106,12 +107,24 @@ class HarmoniousCurvesEditor:
         self._radio_circles = []           # 面板 Circle patch 列表
         self._color_patches = []           # 面板色块 Rectangle 列表
 
+        # 底部状态信息 — 数字加粗，描述浅色跟随
+        self.info_num = self.fig.text(
+            0.05, 0.02, "", fontsize=10, fontweight='bold',
+            color='#333333', va='bottom', ha='left',
+        )
+        self.info_tag = self.fig.text(
+            0.13, 0.02, "", fontsize=8, color='#999999',
+            va='bottom', ha='left',
+        )
+
         # 事件绑定
         self.canvas.mpl_connect('button_press_event', self.on_press)
         self.canvas.mpl_connect('motion_notify_event', self.on_motion)
         self.canvas.mpl_connect('button_release_event', self.on_release)
         self.canvas.mpl_connect('key_press_event', self.on_key)
         self.canvas.mpl_connect('button_press_event', self.on_double_click)
+
+        self._update_selection_info()
 
     def set_radio_ref(self, radio_menu, labels):
         self.radio_menu = radio_menu
@@ -152,7 +165,8 @@ class HarmoniousCurvesEditor:
             valid_points = [(c, p) for c, p in self._selected_points if c == self.active_curve_idx]
             self._selected_points = valid_points
         self._refresh_visual_style()
-        self._reset_slider_widgets() 
+        self._reset_slider_widgets()
+        self._update_selection_info()
 
     def _refresh_visual_style(self):
         for idx, curve in enumerate(self.curves):
@@ -199,6 +213,31 @@ class HarmoniousCurvesEditor:
                     curve['spline_line'].set_linewidth(1.0)
         self.canvas.draw_idle()
 
+    def _update_selection_info(self):
+        """Show current selection scope at the bottom — numbers in bold"""
+        if not self.curves:
+            self.info_num.set_text("")
+            self.info_tag.set_text("")
+            return
+
+        if self._selected_points:
+            n = len(self._selected_points)
+            cnt = {}
+            for c, _ in self._selected_points:
+                cnt[c] = cnt.get(c, 0) + 1
+            detail = ", ".join(f"C{c}: {n_}" for c, n_ in sorted(cnt.items()))
+            self.info_num.set_text(f"{n} pts")
+            self.info_tag.set_text(f"Box-sel  ({detail})")
+        elif self.active_curve_idx is not None:
+            n = len(self.curves[self.active_curve_idx]['y'])
+            self.info_num.set_text(f"{n} pts")
+            self.info_tag.set_text(f"{self.current_label}")
+        else:
+            total = sum(len(c['y']) for c in self.curves)
+            self.info_num.set_text(f"{total} pts")
+            nc, ppc = len(self.curves), len(self.curves[0]['y'])
+            self.info_tag.set_text(f"All ({nc} curves x {ppc})")
+
     def _clear_selection(self):
         self._selected_points.clear()
         self._batch_moving = False
@@ -208,6 +247,7 @@ class HarmoniousCurvesEditor:
             self._select_rect = None
         self._refresh_visual_style()
         self._reset_slider_widgets()
+        self._update_selection_info()
 
     def add_curve(self, x_ctrl, y_ctrl, color='blue', name="Curve"):
         x = np.array(x_ctrl, dtype=float)
@@ -407,6 +447,7 @@ class HarmoniousCurvesEditor:
         self._save_current_state()
         self._reset_slider_widgets()
         self._hide_drop_hint()
+        self._update_selection_info()
 
         fname = os.path.basename(file_path)
         self.fig.canvas.manager.set_window_title(f"CurveMagician - {fname}")
@@ -627,13 +668,16 @@ class HarmoniousCurvesEditor:
         )
 
     def setup_drag_and_drop(self):
-        """注册 Tk 窗口为文件拖放目标。"""
+        """注册 Tk Canvas 为文件拖放目标。"""
         if not HAS_DND:
             return
         try:
-            window = self.fig.canvas.manager.window
-            window.drop_target_register(DND_FILES)
-            window.dnd_bind('<<Drop>>', self._on_drop)
+            import tkinter as tk
+            root = tk._default_root or self.fig.canvas.manager.window.winfo_toplevel()
+            TkinterDnD.require(root)                          # 加载 Tcl DnD 扩展
+            canvas_widget = self.fig.canvas.get_tk_widget()
+            canvas_widget.drop_target_register(DND_FILES)
+            canvas_widget.dnd_bind('<<Drop>>', self._on_drop)
             print("文件拖拽功能已启用")
         except Exception as e:
             print(f"拖拽注册失败: {e}")
@@ -664,6 +708,7 @@ class HarmoniousCurvesEditor:
 
         if event.inaxes in slider_axes:
             self._is_sliding = True
+            self._noise_seed = np.random.randint(0, 2**31)  # 新拖拽 = 新种子
             return
 
         if event.inaxes != self.ax:
@@ -734,11 +779,25 @@ class HarmoniousCurvesEditor:
             self._refresh_visual_style()
 
     def on_release(self, event):
+        # ---- selection rect cleanup must always run ----
+        if self._selecting:
+            self._selecting = False
+            if (self._select_start and event.xdata is not None and event.ydata is not None):
+                x0, y0 = self._select_start
+                x1, y1 = event.xdata, event.ydata
+                self._selection_x_bounds = (min(x0, x1), max(x0, x1))
+                self._selected_points = self._select_points_in_rect(x0, y0, x1, y1)
+                self._refresh_visual_style()
+            if self._select_rect is not None:
+                self._select_rect.remove()
+                self._select_rect = None
+
         if self._is_toolbar_active():
             return
 
         if self._is_sliding:
             self._is_sliding = False
+            self._noise_seed = None
             self._save_current_state()
             self._slider_base_state = [{'y': crv['y'].copy()} for crv in self.curves]
             return
@@ -754,18 +813,6 @@ class HarmoniousCurvesEditor:
         if self._batch_moving:
             need_save = True
 
-        if self._selecting:
-            self._selecting = False
-            if self._select_start and event.xdata is not None and event.ydata is not None:
-                x0, y0 = self._select_start
-                x1, y1 = event.xdata, event.ydata
-                self._selection_x_bounds = (min(x0, x1), max(x0, x1))
-                self._selected_points = self._select_points_in_rect(x0, y0, x1, y1)
-                self._refresh_visual_style()
-            if self._select_rect is not None:
-                self._select_rect.remove()
-                self._select_rect = None
-
         self._active_curve_idx = None
         self._active_point_idx = None
         self._batch_moving = False
@@ -776,6 +823,8 @@ class HarmoniousCurvesEditor:
             self._save_current_state()
             self._reset_slider_widgets()
             self._expand_axes_if_needed()
+
+        self._update_selection_info()
 
     def _get_closest_point(self, event):
         if not self.curves or event.xdata is None or event.ydata is None:
@@ -825,6 +874,7 @@ class HarmoniousCurvesEditor:
         try:
             val = int(text)
             self.neighbor_num = max(0, val)
+            self._update_selection_info()
         except ValueError:
             print("Please enter an integer!")
 
@@ -918,13 +968,13 @@ class HarmoniousCurvesEditor:
                 smoothed = uniform_filter1d(orig_y.astype(float), size=smooth_val)
                 orig_y[p_idxs] = smoothed[p_idxs]
 
-            # 3. 加噪
+            # 3. 加噪（同一拖拽内用固定种子，不闪；不同拖拽间种子不同）
             if noise_coeff > 0:
                 data_range = np.std(orig_y[p_idxs]) if len(p_idxs) > 1 else np.mean(np.abs(orig_y[p_idxs]))
                 if data_range == 0: data_range = 1.0
-                
-                np.random.seed(42)  
-                noise = np.random.normal(0, data_range * 0.05 * noise_coeff, size=len(p_idxs))
+
+                rng = np.random.RandomState(self._noise_seed or 0)
+                noise = rng.normal(0, data_range * 0.05 * noise_coeff, size=len(p_idxs))
                 orig_y[p_idxs] += noise
 
             self.curves[c_idx]['y'][:] = orig_y
@@ -932,6 +982,7 @@ class HarmoniousCurvesEditor:
 
         self._expand_axes_if_needed()
         self._refresh_visual_style()
+        self._update_selection_info()
 
 
 # ===================== 主程序 =====================
@@ -960,9 +1011,9 @@ if __name__ == "__main__":
     ax_btn_save  = plt.axes([0.23, 0.93, 0.10, 0.035])
     ax_input_n   = plt.axes([0.35, 0.93, 0.12, 0.035])
 
-    ax_slider_scale  = plt.axes([0.84, 0.91, 0.12, 0.018], facecolor='#e0e0e0')
-    ax_slider_smooth = plt.axes([0.84, 0.86, 0.12, 0.018], facecolor='#e0e0e0')
-    ax_slider_noise  = plt.axes([0.84, 0.81, 0.12, 0.018], facecolor='#e0e0e0')
+    ax_slider_scale  = plt.axes([0.80, 0.89, 0.18, 0.040], facecolor='#e0e0e0')
+    ax_slider_smooth = plt.axes([0.80, 0.84, 0.18, 0.040], facecolor='#e0e0e0')
+    ax_slider_noise  = plt.axes([0.80, 0.79, 0.18, 0.040], facecolor='#e0e0e0')
 
     ax_radio = plt.axes([0.78, 0.08, 0.20, 0.68], facecolor='#fbfbfb')
 

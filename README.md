@@ -33,7 +33,7 @@
 # 基础依赖（必需）
 pip install numpy matplotlib scipy
 
-# 扩展依赖（推荐）
+# 扩展依赖（推荐，支持 CSV/Excel 与拖拽）
 pip install pandas openpyxl tkinterdnd2
 
 # 运行
@@ -183,7 +183,7 @@ shape = (M 采样点, N 曲线)
 | `matplotlib` | ✅ | 图形界面（TkAgg 后端）、交互组件 |
 | `scipy` | ✅ | B 样条插值 (`splprep`/`splev`)、均匀滤波 |
 | `pandas` | 推荐 | CSV/Excel 读写 |
-| `openpyxl` | 推荐 | Excel .xlsx 格式支持 |
+| `openpyxl` | 推荐 | pandas 读写 .xlsx 的底层引擎 |
 | `tkinterdnd2` | 推荐 | 文件拖拽加载（跨平台） |
 
 ---
