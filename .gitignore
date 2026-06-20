@@ -11,6 +11,8 @@ git_passwd.pub
 
 # Python 临时文件
 __pycache__/
+bak/
+node_modules/
 *.pyc
 *.pyo
 *.pyd

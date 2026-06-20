@@ -3,21 +3,20 @@ matplotlib.use('TkAgg')
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.interpolate import splprep, splev
-import os
+from os.path import splitext, basename
 from matplotlib.patches import Rectangle, Circle
-import matplotlib.widgets as mwidgets
-from matplotlib.widgets import Button, TextBox, Slider
+from matplotlib.widgets import AxesWidget, Button, TextBox, Slider
+from scipy.interpolate import splprep, splev
 from scipy.ndimage import uniform_filter1d
 from tkinter import filedialog, messagebox
 
-# 可选依赖：pandas 用于 Excel/CSV 读写
+# 可选依赖：openpyxl 用于 Excel 读写（CSV 走 numpy）
 try:
-    import pandas as pd
-    HAS_PANDAS = True
+    from openpyxl import load_workbook, Workbook
+    HAS_EXCEL = True
 except ImportError:
-    HAS_PANDAS = False
-    print("提示: 安装 pandas + openpyxl 可支持 CSV/Excel 格式 (pip install pandas openpyxl)")
+    HAS_EXCEL = False
+    print("提示: 安装 openpyxl 可支持 Excel 格式 (pip install openpyxl)")
 
 # 可选依赖：tkinterdnd2 用于文件拖拽
 try:
@@ -32,7 +31,7 @@ def patch_matplotlib_widgets_safely():
     """
     精准修复 Matplotlib 组件基类的全局事件分发 Bug，增加防重复修改锁，彻底避免无限递归
     """
-    base_class = mwidgets.AxesWidget
+    base_class = AxesWidget
     
     # 检查是否已经修补过，防止重复执行
     if not getattr(base_class, '_is_patched_for_resize', False):
@@ -72,6 +71,7 @@ class HarmoniousCurvesEditor:
 
         self.neighbor_num = 0
         self.ax_n_input = ax_n_input
+        self._typing_axes = {ax_n_input}  # 在这些区域内不响应 delete/backspace
 
         # 框选 & 批量移动
         self._selecting = False
@@ -89,6 +89,7 @@ class HarmoniousCurvesEditor:
         self._is_sliding = False  # 标记当前是否正在拖动滑杆
         self._noise_seed = None   # 单次拖拽缓存噪点种子，松手后重置
         self._tab_index = 0       # Tab 切换曲线索引，默认 All
+        self._last_npts_val = None  # 上次同步到输入框的点数，避免覆盖用户输入
 
         # 组件引用初始化
         self.radio_menu = None
@@ -96,6 +97,7 @@ class HarmoniousCurvesEditor:
         self.slider_scale = None
         self.slider_smooth = None
         self.slider_noise = None
+        self._resample_box = None  # 外部注入的重采样输入框引用
 
         # 文件 I/O 状态
         self.current_file_path = None      # 当前文件路径（用于保存时推断格式）
@@ -108,14 +110,14 @@ class HarmoniousCurvesEditor:
         self._radio_circles = []           # 面板 Circle patch 列表
         self._color_patches = []           # 面板色块 Rectangle 列表
 
-        # 底部状态信息 — 数字加粗，描述浅色跟随
+        # 底部状态信息 — 大号数字加粗，描述浅色跟随
         self.info_num = self.fig.text(
-            0.05, 0.02, "", fontsize=10, fontweight='bold',
-            color='#333333', va='bottom', ha='left',
+            0.05, 0.02, "", fontsize=14, fontweight='bold',
+            color='#222222', va='bottom', ha='left',
         )
         self.info_tag = self.fig.text(
-            0.13, 0.02, "", fontsize=8, color='#999999',
-            va='bottom', ha='left',
+            0.15, 0.02, "", fontsize=10, color='#555555',
+            fontweight='bold', va='bottom', ha='left',
         )
 
         # 事件绑定
@@ -128,7 +130,7 @@ class HarmoniousCurvesEditor:
         # Tk 级别绑定 Tab（matplotlib key_press_event 收不到 Tab）
         self._setup_tk_tab()
         # 点击绘图区时确保键盘焦点回到 canvas
-        self.canvas.mpl_connect('button_press_event', self._ensure_focus, )
+        self.canvas.mpl_connect('button_press_event', self._ensure_focus)
 
         self._update_selection_info()
 
@@ -220,32 +222,67 @@ class HarmoniousCurvesEditor:
         self.canvas.draw_idle()
 
     def _update_selection_info(self):
-        """Show current selection scope at the bottom — numbers in bold"""
+        """显示当前选中的控制点信息，并实时初始化 N-pts 右侧重采样输入框"""
         if not self.curves:
             self.info_num.set_text("")
             self.info_tag.set_text("")
             return
 
+        current_resample_val = ""
+
         if self._selected_points:
+            # 1. 处于框选状态：统计每条曲线被选中的点数
+            by_curve = {}
+            for c, p in self._selected_points:
+                by_curve.setdefault(c, []).append(p)
+            
             n = len(self._selected_points)
-            cnt = {}
-            for c, _ in self._selected_points:
-                cnt[c] = cnt.get(c, 0) + 1
-            detail = ", ".join(f"C{c}: {n_}" for c, n_ in sorted(cnt.items()))
+            detail = ", ".join(f"C{c}: {len(p_)}p" for c, p_ in sorted(by_curve.items()))
             self.info_num.set_text(f"{n} pts")
             self.info_tag.set_text(f"Box-sel  ({detail})")
+
+            # 提取所有被选中曲线片段的点数集合
+            selected_counts = {len(p_idxs) for p_idxs in by_curve.values()}
+            if len(selected_counts) == 1:
+                # 只有当框选的每条曲线片段内的点数完全一致时，才在输入框初始化该数字
+                current_resample_val = str(selected_counts.pop())
+            else:
+                current_resample_val = "---"  # 不一致则显示占位符，提示输入
+
         elif self.active_curve_idx is not None:
+            # 2. 未框选，但单选了某一条曲线
             n = len(self.curves[self.active_curve_idx]['y'])
             self.info_num.set_text(f"{n} pts")
             self.info_tag.set_text(f"{self.current_label}")
+            current_resample_val = str(n)
         else:
+            # 3. 默认 All 状态，未进行框选
             total = sum(len(c['y']) for c in self.curves)
             self.info_num.set_text(f"{total} pts")
             nc, ppc = len(self.curves), len(self.curves[0]['y'])
             self.info_tag.set_text(f"All ({nc} curves x {ppc})")
+            
+            # 检查是否所有曲线的总长度都相同
+            all_counts = {len(c['y']) for c in self.curves}
+            current_resample_val = str(all_counts.pop()) if len(all_counts) == 1 else "---"
+
+        # 同步输入框：点数一致填数字，不一致填 "---"
+        if hasattr(self, '_resample_box') and self._resample_box:
+            if current_resample_val != self._last_npts_val:
+                self._resample_box.set_val(current_resample_val)
+                self._last_npts_val = current_resample_val
+
+        self.canvas.draw_idle()
+
+    def _canvas_has_focus(self):
+        try:
+            canvas = self.fig.canvas.get_tk_widget()
+            focused = canvas.focus_get()
+            return focused is None or focused is canvas
+        except Exception:
+            return True
 
     def _setup_tk_tab(self):
-        """Tk 级别绑定 Tab，绕过 Tkinter 焦点遍历拦截"""
         try:
             canvas_widget = self.fig.canvas.get_tk_widget()
             def _on_tk_tab(event):
@@ -255,13 +292,12 @@ class HarmoniousCurvesEditor:
                 if self.radio_menu:
                     self.radio_menu.set_active(self._tab_index)
                 self.set_active_curve(self.radio_labels[self._tab_index])
-                return 'break'  # 阻止 Tk 默认焦点切换
+                return 'break'
             canvas_widget.bind('<Tab>', _on_tk_tab)
         except Exception:
             pass
 
     def _ensure_focus(self, event=None):
-        """点击绘图区时把键盘焦点还给 canvas"""
         try:
             self.fig.canvas.get_tk_widget().focus_set()
         except Exception:
@@ -279,10 +315,8 @@ class HarmoniousCurvesEditor:
         self._update_selection_info()
 
     def _delete_selected_points(self):
-        """删除框选的控制点，保留 >= 4 点，x 轴自动重新编号。"""
         if not self._selected_points:
             return
-        # 按曲线分组
         by_curve = {}
         for c, p in self._selected_points:
             by_curve.setdefault(c, []).append(p)
@@ -301,6 +335,103 @@ class HarmoniousCurvesEditor:
 
         if deleted_any:
             self._save_current_state()
+        self._clear_selection()
+
+    def _do_resample(self, event=None):
+        """核心业务功能：将选中曲线的局部控制点，平滑增点/降点重采样为 Y 个点"""
+        if not hasattr(self, '_resample_box') or not self._resample_box:
+            return
+        
+        try:
+            n_new = int(self._resample_box.text)
+        except ValueError:
+            messagebox.showwarning("输入错误", "请输入有效的段内目标点数整数（如 10）")
+            return
+        if n_new < 4:
+            messagebox.showwarning("约束错误", "局部段重采样后至少需要保留 4 个控制点以维持三次样条拟合")
+            return
+
+        # 1. 确定当前哪些曲线和哪些点将被作为目标处理
+        by_curve = {}
+        if self._selected_points:
+            for c, p in self._selected_points:
+                if self.active_curve_idx is None or c == self.active_curve_idx:
+                    by_curve.setdefault(c, []).append(p)
+        else:
+            targets = [self.active_curve_idx] if self.active_curve_idx is not None else list(range(len(self.curves)))
+            for c in targets:
+                by_curve[c] = list(range(len(self.curves[c]['y'])))
+
+        if not by_curve:
+            print("当前未选中任何有效曲线或控制点")
+            return
+
+        # 2. 【强约束判定】确保当前所有选中的曲线，它们被选中的点数（X）必须完全一致
+        counts = {len(p_idxs) for p_idxs in by_curve.values()}
+        if len(counts) > 1:
+            messagebox.showerror("重采样失败", f"强约束未满足！当前框选的各曲线内部点数不一致: {counts}，无法批量重采样。")
+            return
+
+        modified_any = False
+
+        # 3. 开始执行带边界保护的三次样条局部重采样
+        for c_idx, p_idxs in by_curve.items():
+            curve = self.curves[c_idx]
+            orig_y = curve['y']
+            total_pts = len(orig_y)
+
+            i_min, i_max = min(p_idxs), max(p_idxs)
+            n_old = i_max - i_min + 1
+
+            if n_old == n_new and self._selected_points:
+                continue  # 数量一样且是局部框选，不作变动
+
+            # 为保证交接处极度平滑，向左右未选中区外扩 2 个控制点作为“缓冲约束区”
+            pad = 2
+            ext_min = max(0, i_min - pad)
+            ext_max = min(total_pts - 1, i_max + pad)
+
+            seg_y = orig_y[ext_min:ext_max + 1]
+            seg_x = np.arange(len(seg_y), dtype=float)
+
+            k_order = 3 if len(seg_y) > 3 else (len(seg_y) - 1)
+            if k_order < 1:
+                continue
+
+            # 构建样条核心参数
+            tck, u = splprep([seg_x, seg_y], s=0, k=k_order)
+
+            # 计算生成的新段里包含的缓冲区节点数
+            left_pad_count = i_min - ext_min
+            right_pad_count = ext_max - i_max
+            total_seg_new_count = left_pad_count + n_new + right_pad_count
+
+            u_new = np.linspace(0, 1, total_seg_new_count)
+            _, y_resampled_ext = splev(u_new, tck)
+
+            # 剔除缓冲区，完美截取并恢复我们需要的 Y 个新点
+            start_idx = left_pad_count
+            end_idx = total_seg_new_count - right_pad_count
+            y_resampled_core = y_resampled_ext[start_idx:end_idx]
+
+            # 完美拼回大数组
+            y_new = np.concatenate([
+                orig_y[:i_min],
+                y_resampled_core,
+                orig_y[i_max + 1:]
+            ])
+
+            # 重新构建自增一维 X 轴索引并更新艺术家图元
+            curve['x'] = np.arange(len(y_new), dtype=float)
+            curve['y'] = y_new
+            self._update_spline(c_idx)
+            modified_any = True
+
+        if modified_any:
+            self._save_current_state()
+            print(f"成功！已将各曲线选中段的控制点平滑转换为了 {n_new} 个点。")
+        
+        # 联动重置清除框选状态
         self._clear_selection()
 
     def add_curve(self, x_ctrl, y_ctrl, color='blue', name="Curve"):
@@ -328,7 +459,6 @@ class HarmoniousCurvesEditor:
     # ===================== 文件 I/O =====================
 
     def _clear_all_curves(self):
-        """移除所有曲线 artist 并重置编辑器状态。"""
         for curve in self.curves:
             for key in ['ctrl_points', 'spline_line', 'hl_ctrl_points', 'hl_spline_line']:
                 if curve.get(key) is not None:
@@ -344,13 +474,12 @@ class HarmoniousCurvesEditor:
         self._active_curve_idx = None
         self._active_point_idx = None
         self._tab_index = 0
+        self._last_npts_val = None
         self._hide_drop_hint()
-        # 重置坐标轴范围，等新数据加载后再自动适配
         self.ax.relim()
         self.ax.autoscale_view()
 
-    def _auto_range_axes(self):
-        """根据当前所有曲线数据自动适配 XY 轴范围，留 8% 边距。"""
+    def _auto_range_axes(self, event=None):
         if not self.curves:
             return
         all_x = np.concatenate([c['x'] for c in self.curves])
@@ -361,7 +490,6 @@ class HarmoniousCurvesEditor:
         x_min, x_max = np.min(all_x), np.max(all_x)
         y_min, y_max = np.min(all_y), np.max(all_y)
 
-        # 避免零范围（如只有一条水平线）
         x_range = x_max - x_min or 1.0
         y_range = y_max - y_min or 1.0
         margin = 0.08
@@ -371,10 +499,6 @@ class HarmoniousCurvesEditor:
         self.canvas.draw_idle()
 
     def _expand_axes_if_needed(self):
-        """
-        检查当前曲线数据是否超出坐标轴范围，如果是则向外扩展（只扩大不缩小）。
-        保证拖拽/缩放/加噪后曲线不会跑到视野之外。
-        """
         if not self.curves:
             return
         all_y = np.concatenate([c['y'] for c in self.curves])
@@ -385,7 +509,7 @@ class HarmoniousCurvesEditor:
         cur_ylo, cur_yhi = self.ax.get_ylim()
 
         y_range = y_max - y_min or 1.0
-        margin = 0.10  # 超出时留 10% 余量
+        margin = 0.10
 
         new_lo, new_hi = cur_ylo, cur_yhi
         changed = False
@@ -402,8 +526,7 @@ class HarmoniousCurvesEditor:
             self.canvas.draw_idle()
 
     def _detect_format(self, file_path):
-        """根据扩展名返回格式标识。"""
-        ext = os.path.splitext(file_path)[1].lower()
+        ext = splitext(file_path)[1].lower()
         if ext == '.csv':
             return 'csv'
         elif ext in ('.xlsx', '.xls'):
@@ -414,54 +537,40 @@ class HarmoniousCurvesEditor:
             raise ValueError(f"不支持的文件格式: {ext}（支持 .csv .xlsx .npy）")
 
     def _load_data_from_file(self, file_path):
-        """从文件读取曲线数据，返回 2D numpy 数组 (N_points, N_curves)。
-
-        智能化方向判断：以较小的维度作为曲线数（列），较大的维度作为采样点数（行）。
-        每一列 = 一条曲线，每一行 = 一个采样点。
-        """
         fmt = self._detect_format(file_path)
 
         if fmt == 'csv':
-            if not HAS_PANDAS:
-                raise ImportError("读取 CSV 需要 pandas 库: pip install pandas")
-            df = pd.read_csv(file_path, header=None)
-            if df.empty:
-                raise ValueError("CSV 文件为空")
-            data = df.values.astype(float)
-
+            data = np.loadtxt(file_path, delimiter=',', dtype=float, ndmin=2)
         elif fmt == 'excel':
-            if not HAS_PANDAS:
-                raise ImportError("读取 Excel 需要 pandas 和 openpyxl: pip install pandas openpyxl")
-            df = pd.read_excel(file_path, header=None)
-            if df.empty:
+            if not HAS_EXCEL:
+                raise ImportError("读取 Excel 需要 openpyxl: pip install openpyxl")
+            wb = load_workbook(file_path, data_only=True)
+            ws = wb.active
+            rows = [[cell.value or 0 for cell in row] for row in ws.iter_rows()]
+            if not rows:
                 raise ValueError("Excel 文件为空")
-            data = df.values.astype(float)
-
+            data = np.array(rows, dtype=float)
+            wb.close()
         elif fmt == 'npy':
             data = np.load(file_path, allow_pickle=True)
 
         if data.ndim == 1:
-            data = data.reshape(-1, 1)          # 单列 = 一条曲线
+            data = data.reshape(-1, 1)
         if data.ndim != 2:
             raise ValueError(f"数据必须是 1D 或 2D，当前 shape: {data.shape}")
 
-        # ---- 智能方向判断：较小维度 = 曲线数（列），较大维度 = 采样点（行） ----
         n_rows, n_cols = data.shape
         if n_rows < n_cols:
-            # 行少列多 → 行=曲线，列=点 → 转置为列式
             data = data.T
             print(f"  方向检测: {n_rows}行×{n_cols}列 → 自动转置为 {n_cols}点×{n_rows}曲线")
         elif n_cols < n_rows:
-            # 列少行多 → 已是列式（列=曲线，行=点）
             print(f"  方向检测: {n_rows}行×{n_cols}列 → 已是列式 ({n_rows}点×{n_cols}曲线)")
-        # else: 方阵，保持原样，默认列=曲线
 
         if data.shape[0] < 4:
             raise ValueError(f"每条曲线至少需要 4 个采样点，当前仅 {data.shape[0]} 行")
         return data
 
     def load_curves_from_file(self, file_path=None):
-        """打开文件（或弹出对话框）加载曲线数据，替换当前所有曲线。"""
         if file_path is None:
             file_path = filedialog.askopenfilename(
                 title="打开曲线文件",
@@ -473,7 +582,7 @@ class HarmoniousCurvesEditor:
                 ]
             )
             if not file_path:
-                return  # 用户取消
+                return
 
         try:
             data = self._load_data_from_file(file_path)
@@ -485,7 +594,6 @@ class HarmoniousCurvesEditor:
         self._clear_all_curves()
         self._clear_radio_panel()
 
-        # data shape: (N_points, N_curves) — columns are curves
         n_curves = data.shape[1]
         n_points = data.shape[0]
         curve_colors = []
@@ -496,20 +604,17 @@ class HarmoniousCurvesEditor:
             self.add_curve(np.arange(n_points), data[:, idx], color=color, name=name)
 
         self._build_radio_panel(curve_colors)
-
         self._auto_range_axes()
-
         self._save_current_state()
         self._reset_slider_widgets()
         self._hide_drop_hint()
         self._update_selection_info()
 
-        fname = os.path.basename(file_path)
+        fname = basename(file_path)
         self.fig.canvas.manager.set_window_title(f"CurveMagician - {fname}")
         print(f"已加载 {n_curves} 条曲线 ({n_points} 点/条)，来自 {file_path}")
 
     def save_file(self, event=None):
-        """弹出保存对话框，支持 CSV / Excel / NPY 格式。"""
         if not self.curves:
             messagebox.showwarning("保存", "没有曲线数据可保存。")
             return
@@ -517,8 +622,8 @@ class HarmoniousCurvesEditor:
         default_ext = ".npy"
         initial_file = "curves.npy"
         if self.current_file_path:
-            default_ext = os.path.splitext(self.current_file_path)[1]
-            initial_file = os.path.basename(self.current_file_path)
+            default_ext = splitext(self.current_file_path)[1]
+            initial_file = basename(self.current_file_path)
 
         file_path = filedialog.asksaveasfilename(
             title="保存曲线为",
@@ -535,37 +640,34 @@ class HarmoniousCurvesEditor:
 
         try:
             fmt = self._detect_format(file_path)
-            # 收集 Y 值 → (N_curves, N_points) → 转置为列式 (N_points, N_curves)
-            # 每一列 = 一条曲线，每一行 = 一个采样点
             data = np.array([curve['y'] for curve in self.curves]).T
 
             if fmt == 'csv':
-                if not HAS_PANDAS:
-                    np.savetxt(file_path, data, delimiter=',')
-                else:
-                    pd.DataFrame(data).to_csv(file_path, index=False, header=False)
+                np.savetxt(file_path, data, delimiter=',', fmt='%.8g')
             elif fmt == 'excel':
-                if not HAS_PANDAS:
-                    raise ImportError("保存 Excel 需要 pandas 和 openpyxl: pip install pandas openpyxl")
-                pd.DataFrame(data).to_excel(file_path, index=False, header=False)
+                if not HAS_EXCEL:
+                    raise ImportError("保存 Excel 需要 openpyxl: pip install openpyxl")
+                wb = Workbook()
+                ws = wb.active
+                for row in data:
+                    ws.append(row.tolist())
+                wb.save(file_path)
             elif fmt == 'npy':
                 np.save(file_path, data)
 
             self.current_file_path = file_path
-            fname = os.path.basename(file_path)
+            fname = basename(file_path)
             self.fig.canvas.manager.set_window_title(f"CurveMagician - {fname}")
             print(f"已保存 {data.shape[1]} 条曲线 ({data.shape[0]} 点/条) 到 {file_path}")
         except Exception as e:
             messagebox.showerror("保存错误", f"保存失败:\n{e}")
 
     def on_open_clicked(self, event=None):
-        """Open 按钮回调。"""
         self.load_curves_from_file()
 
     # ===================== 单选面板构建 =====================
 
     def _clear_radio_panel(self):
-        """清空右侧单选面板的所有元素。"""
         if self.ax_radio is None:
             return
         self.ax_radio.cla()
@@ -581,16 +683,15 @@ class HarmoniousCurvesEditor:
         self.radio_labels = []
 
     def _build_radio_panel(self, curve_colors):
-        """构建右侧曲线选择面板（Circle patches + 色块 + 文字）。"""
         if self.ax_radio is None:
             return
 
         ax = self.ax_radio
-        base_labels = ["All"] + [f"Curve {i}" for i in range(len(curve_colors))]
+        base_labels = ["All"] + [self.curves[i]['name'] for i in range(len(curve_colors))]
         num_labels = len(base_labels)
         font_size = 9 if num_labels > 8 else 10
         activecolor = '#2ca02c'
-        active_idx = [0]  # 列表包装
+        active_idx = [0]
 
         ys = np.linspace(1, 0, num_labels + 2)[1:-1]
         dot_radius = 0.022 if num_labels > 8 else 0.030
@@ -633,14 +734,12 @@ class HarmoniousCurvesEditor:
             ax.add_patch(rect)
             self._color_patches.append(rect)
 
-        # ---- 刷新圆圈状态 ----
         def _refresh_dots():
             for i, c in enumerate(self._radio_circles):
                 c.set_facecolor(activecolor if i == active_idx[0] else 'white')
 
         _refresh_dots()
 
-        # ---- 点击回调 ----
         def _on_radio_click(event):
             if event.inaxes != ax or event.button != 1:
                 return
@@ -656,7 +755,6 @@ class HarmoniousCurvesEditor:
 
         self.fig.canvas.mpl_connect('button_press_event', _on_radio_click)
 
-        # ---- 兼容对象：供双击曲线同步选中 ----
         class _RadioCompat:
             labels = base_labels
 
@@ -676,7 +774,6 @@ class HarmoniousCurvesEditor:
     # ===================== 拖拽支持 =====================
 
     def _show_drop_hint(self):
-        """在主图上显示拖放提示文字。"""
         if self.drop_hint is None:
             self.drop_hint = self.ax.text(
                 0.5, 0.5,
@@ -691,13 +788,11 @@ class HarmoniousCurvesEditor:
         self.canvas.draw_idle()
 
     def _hide_drop_hint(self):
-        """隐藏拖放提示文字。"""
         if self.drop_hint is not None:
             self.drop_hint.set_visible(False)
             self.canvas.draw_idle()
 
     def _on_drop(self, event):
-        """处理文件拖放事件。"""
         files = self.fig.canvas.manager.window.tk.splitlist(event.data)
         if not files:
             return
@@ -723,13 +818,12 @@ class HarmoniousCurvesEditor:
         )
 
     def setup_drag_and_drop(self):
-        """注册 Tk Canvas 为文件拖放目标。"""
         if not HAS_DND:
             return
         try:
             import tkinter as tk
             root = tk._default_root or self.fig.canvas.manager.window.winfo_toplevel()
-            TkinterDnD.require(root)                          # 加载 Tcl DnD 扩展
+            TkinterDnD.require(root)
             canvas_widget = self.fig.canvas.get_tk_widget()
             canvas_widget.drop_target_register(DND_FILES)
             canvas_widget.dnd_bind('<<Drop>>', self._on_drop)
@@ -755,7 +849,6 @@ class HarmoniousCurvesEditor:
         if not hasattr(event, 'inaxes') or event.inaxes is None:
             return
 
-        # 判断是否点在滑杆区域
         slider_axes = []
         if self.slider_scale: slider_axes.append(self.slider_scale.ax)
         if self.slider_smooth: slider_axes.append(self.slider_smooth.ax)
@@ -763,7 +856,7 @@ class HarmoniousCurvesEditor:
 
         if event.inaxes in slider_axes:
             self._is_sliding = True
-            self._noise_seed = np.random.randint(0, 2**31)  # 新拖拽 = 新种子
+            self._noise_seed = np.random.randint(0, 2**31)
             return
 
         if event.inaxes != self.ax:
@@ -834,7 +927,6 @@ class HarmoniousCurvesEditor:
             self._refresh_visual_style()
 
     def on_release(self, event):
-        # ---- selection rect cleanup must always run ----
         if self._selecting:
             self._selecting = False
             if (self._select_start and event.xdata is not None and event.ydata is not None):
@@ -846,6 +938,7 @@ class HarmoniousCurvesEditor:
             if self._select_rect is not None:
                 self._select_rect.remove()
                 self._select_rect = None
+            self._update_selection_info()
 
         if self._is_toolbar_active():
             return
@@ -961,8 +1054,9 @@ class HarmoniousCurvesEditor:
             self._clear_selection()
         elif event.key == 'z':
             self.undo()
-        elif event.key in ('delete', 'backspace'):
-            self._delete_selected_points()
+        elif event.key in ('delete'):
+            if self._canvas_has_focus():
+                self._delete_selected_points()
         elif event.key == 'a':
             self._tab_index = 0
             if self.radio_menu and self.radio_labels:
@@ -977,13 +1071,14 @@ class HarmoniousCurvesEditor:
             self.set_active_curve(self.radio_labels[self._tab_index])
 
     def save_curves_npy(self, event=None, filename="adjusted_curves.npy"):
-        """兼容旧接口：快速保存为 .npy 到当前目录（按列存储）。"""
         if not self.curves:
             return
         npy_data = np.array([curve['y'] for curve in self.curves]).T
-        save_dir = os.path.dirname(self.current_file_path) if self.current_file_path else '.'
-        np.save(os.path.join(save_dir, filename), npy_data)
-        print(f"NPY 已保存到: {os.path.join(save_dir, filename)}  ({npy_data.shape[0]} 点 x {npy_data.shape[1]} 曲线)")
+        save_dir = ""
+        if self.current_file_path:
+            save_dir = splitext(self.current_file_path)[0] + "_"
+        np.save(save_dir + filename, npy_data)
+        print(f"NPY 已保存到: {save_dir + filename}  ({npy_data.shape[0]} 点 x {npy_data.shape[1]} 曲线)")
 
     def _reset_slider_widgets(self):
         self._slider_base_state = [{'y': crv['y'].copy()} for crv in self.curves]
@@ -1028,16 +1123,13 @@ class HarmoniousCurvesEditor:
             if len(p_idxs) == 0:
                 continue
             
-            # 1. 缩放
             if scale_val != 1.0:
                 orig_y[p_idxs] = orig_y[p_idxs] * scale_val
 
-            # 2. 平滑
             if smooth_val > 1:
                 smoothed = uniform_filter1d(orig_y.astype(float), size=smooth_val)
                 orig_y[p_idxs] = smoothed[p_idxs]
 
-            # 3. 加噪（同一拖拽内用固定种子，不闪；不同拖拽间种子不同）
             if noise_coeff > 0:
                 data_range = np.std(orig_y[p_idxs]) if len(p_idxs) > 1 else np.mean(np.abs(orig_y[p_idxs]))
                 if data_range == 0: data_range = 1.0
@@ -1054,83 +1146,95 @@ class HarmoniousCurvesEditor:
         self._update_selection_info()
 
 
-# ===================== 主程序 =====================
-if __name__ == "__main__":
-    data_path = './xx.npy'
+# ===================== 演示数据 =====================
+def _make_demo_curves(n_pts=80):
+    """3 条干净利落的正弦曲线：低/中/高频，适合截图做 logo"""
+    x = np.linspace(0, 3 * np.pi, n_pts)
+    curves = [
+        1.0  * np.sin(x),               # 基准波
+        0.65 * np.sin(2.0 * x - 0.8),   # 倍频 + 小振幅
+        0.45 * np.sin(3.5 * x + 0.5),   # 高频 + 更小振幅
+    ]
+    return np.column_stack(curves)  # (n_pts, 3)
 
-    # Generate 12 demo curves if data file doesn't exist
-    # Data shape: (N_points, N_curves) — each COLUMN is a curve
-    if not os.path.exists(data_path):
-        x = np.linspace(0, 10, 50)
-        data = np.array([np.sin(x) + np.random.normal(0, 0.1, 50) for _ in range(12)]).T
-        os.makedirs(os.path.dirname(data_path), exist_ok=True)
-        np.save(data_path, data)
-        print(f"Generated 12 demo curves: {data_path}  (shape: {data.shape[0]} pts x {data.shape[1]} curves)")
 
-    color_list = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-                  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-                  '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5']
+# ===================== UI 工厂 =====================
+def _build_ui():
+    """创建 figure 和所有 axes，返回 (fig, axes_dict)"""
+    fig = plt.figure(figsize=(16, 9))
+    fig.canvas.manager.set_window_title("CurveMagician")
 
-    fig = plt.figure(figsize=(15, 8))
+    ax = {
+        'main':     plt.axes([0.05, 0.10, 0.70, 0.80]),
+        'open':     plt.axes([0.05, 0.94, 0.08, 0.035]),
+        'save':     plt.axes([0.14, 0.94, 0.08, 0.035]),
+        'undo':     plt.axes([0.23, 0.94, 0.08, 0.035]),
+        'neighbor': plt.axes([0.35, 0.94, 0.11, 0.035]),
+        'fit':      plt.axes([0.47, 0.94, 0.06, 0.035]),
+        'npts':     plt.axes([0.57, 0.94, 0.07, 0.035]),
+        'apply':    plt.axes([0.65, 0.94, 0.08, 0.035]),
+        'scale':    plt.axes([0.80, 0.89, 0.18, 0.040], facecolor='#e0e0e0'),
+        'smooth':   plt.axes([0.80, 0.84, 0.18, 0.040], facecolor='#e0e0e0'),
+        'noise':    plt.axes([0.80, 0.79, 0.18, 0.040], facecolor='#e0e0e0'),
+        'radio':    plt.axes([0.78, 0.08, 0.20, 0.68], facecolor='#fbfbfb'),
+    }
+    ax['main'].grid(True, linestyle='--', alpha=0.45)
+    return fig, ax
 
-    # ==== UI layout ====
-    ax_main = plt.axes([0.05, 0.1, 0.70, 0.8])
-    ax_btn_open  = plt.axes([0.05, 0.93, 0.08, 0.035])   # Open
-    ax_btn_undo  = plt.axes([0.14, 0.93, 0.08, 0.035])
-    ax_btn_save  = plt.axes([0.23, 0.93, 0.10, 0.035])
-    ax_input_n   = plt.axes([0.35, 0.93, 0.12, 0.035])
 
-    ax_slider_scale  = plt.axes([0.80, 0.89, 0.18, 0.040], facecolor='#e0e0e0')
-    ax_slider_smooth = plt.axes([0.80, 0.84, 0.18, 0.040], facecolor='#e0e0e0')
-    ax_slider_noise  = plt.axes([0.80, 0.79, 0.18, 0.040], facecolor='#e0e0e0')
+def _wire_widgets(editor, ax):
+    """创建按钮/滑杆/输入框并连接到编辑器"""
+    TextBox(ax['neighbor'], "+/-N", initial="0").on_submit(editor.set_neighbor_num)
 
-    ax_radio = plt.axes([0.78, 0.08, 0.20, 0.68], facecolor='#fbfbfb')
+    resample_box = TextBox(ax['npts'], "", initial="")
+    editor._resample_box = resample_box
+    editor._typing_axes.add(ax['npts'])
+    Button(ax['apply'], 'Resample').on_clicked(editor._do_resample)
 
-    ax_main.grid(True, linestyle='--', alpha=0.6)
+    Button(ax['open'], 'Open').on_clicked(editor.on_open_clicked)
+    Button(ax['save'], 'Save').on_clicked(editor.save_file)
+    Button(ax['undo'], 'Undo').on_clicked(editor.undo)
+    Button(ax['fit'], 'Fit').on_clicked(editor._auto_range_axes)
 
-    # ==== Create editor ====
-    text_box = TextBox(ax_input_n, "", initial="0")
-    editor = HarmoniousCurvesEditor(
-        ax_main, fig, ax_input_n,
-        ax_radio=ax_radio, color_list=color_list,
-    )
-    text_box.on_submit(editor.set_neighbor_num)
+    sliders = {
+        'scale':  Slider(ax['scale'],  'Scale ',  0.0, 2.0, valinit=1.0, valfmt='%.2f', color='#4682b4'),
+        'smooth': Slider(ax['smooth'], 'Smooth',  1,   15,  valinit=1,   valfmt='%d',   color='#4682b4'),
+        'noise':  Slider(ax['noise'],  'Noise ',  0.0, 5.0, valinit=0.0, valfmt='%.1f', color='#4682b4'),
+    }
+    for s in sliders.values():
+        s.label.set_size(9)
+    editor.slider_scale  = sliders['scale']
+    editor.slider_smooth = sliders['smooth']
+    editor.slider_noise  = sliders['noise']
+    for s in sliders.values():
+        s.on_changed(editor.on_slider_changed)
 
-    # ==== Buttons ====
-    btn_open = Button(ax_btn_open, 'Open')
-    btn_open.on_clicked(editor.on_open_clicked)
-    btn_undo = Button(ax_btn_undo, 'Undo')
-    btn_undo.on_clicked(editor.undo)
-    btn_save = Button(ax_btn_save, 'Save')
-    btn_save.on_clicked(editor.save_file)
 
-    # ==== Sliders ====
-    s_scale = Slider(ax_slider_scale, 'Scale ', 0.0, 2.0, valinit=1.0, valfmt='%.2f', color='#4682b4')
-    s_smooth = Slider(ax_slider_smooth, 'Smooth', 1, 15, valinit=1, valfmt='%d', color='#4682b4')
-    s_noise = Slider(ax_slider_noise, 'Noise ', 0.0, 5.0, valinit=0.0, valfmt='%.1f', color='#4682b4')
-
-    s_scale.label.set_size(9)
-    s_smooth.label.set_size(9)
-    s_noise.label.set_size(9)
-
-    editor.slider_scale = s_scale
-    editor.slider_smooth = s_smooth
-    editor.slider_noise = s_noise
-
-    s_scale.on_changed(editor.on_slider_changed)
-    s_smooth.on_changed(editor.on_slider_changed)
-    s_noise.on_changed(editor.on_slider_changed)
-
-    # ==== Initial data load ====
-    if os.path.exists(data_path):
-        editor.load_curves_from_file(os.path.abspath(data_path))
-    else:
-        editor._show_drop_hint()
-
+def _load_demo(editor, colors):
+    """加载默认演示曲线"""
+    data = _make_demo_curves()
+    for idx in range(data.shape[1]):
+        editor.add_curve(np.arange(data.shape[0]), data[:, idx],
+                         color=colors[idx % len(colors)], name=f"Curve {idx}")
+    editor._build_radio_panel(
+        [colors[i % len(colors)] for i in range(data.shape[1])])
+    editor._auto_range_axes()
     editor._save_current_state()
     editor._reset_slider_widgets()
+    editor._update_selection_info()
 
-    # ==== Enable drag-and-drop ====
+
+# ===================== 主程序 =====================
+if __name__ == "__main__":
+    COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+              '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5']
+
+    fig, ax = _build_ui()
+    editor = HarmoniousCurvesEditor(
+        ax['main'], fig, ax['neighbor'], ax_radio=ax['radio'], color_list=COLORS)
+
+    _wire_widgets(editor, ax)
+    _load_demo(editor, COLORS)
     editor.setup_drag_and_drop()
-
     plt.show()
