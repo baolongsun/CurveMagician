@@ -88,6 +88,7 @@ class HarmoniousCurvesEditor:
         self._slider_base_state = None
         self._is_sliding = False  # 标记当前是否正在拖动滑杆
         self._noise_seed = None   # 单次拖拽缓存噪点种子，松手后重置
+        self._tab_index = 0       # Tab 切换曲线索引，默认 All
 
         # 组件引用初始化
         self.radio_menu = None
@@ -123,6 +124,11 @@ class HarmoniousCurvesEditor:
         self.canvas.mpl_connect('button_release_event', self.on_release)
         self.canvas.mpl_connect('key_press_event', self.on_key)
         self.canvas.mpl_connect('button_press_event', self.on_double_click)
+
+        # Tk 级别绑定 Tab（matplotlib key_press_event 收不到 Tab）
+        self._setup_tk_tab()
+        # 点击绘图区时确保键盘焦点回到 canvas
+        self.canvas.mpl_connect('button_press_event', self._ensure_focus, )
 
         self._update_selection_info()
 
@@ -238,6 +244,29 @@ class HarmoniousCurvesEditor:
             nc, ppc = len(self.curves), len(self.curves[0]['y'])
             self.info_tag.set_text(f"All ({nc} curves x {ppc})")
 
+    def _setup_tk_tab(self):
+        """Tk 级别绑定 Tab，绕过 Tkinter 焦点遍历拦截"""
+        try:
+            canvas_widget = self.fig.canvas.get_tk_widget()
+            def _on_tk_tab(event):
+                if not self.radio_labels:
+                    return
+                self._tab_index = (self._tab_index + 1) % len(self.radio_labels)
+                if self.radio_menu:
+                    self.radio_menu.set_active(self._tab_index)
+                self.set_active_curve(self.radio_labels[self._tab_index])
+                return 'break'  # 阻止 Tk 默认焦点切换
+            canvas_widget.bind('<Tab>', _on_tk_tab)
+        except Exception:
+            pass
+
+    def _ensure_focus(self, event=None):
+        """点击绘图区时把键盘焦点还给 canvas"""
+        try:
+            self.fig.canvas.get_tk_widget().focus_set()
+        except Exception:
+            pass
+
     def _clear_selection(self):
         self._selected_points.clear()
         self._batch_moving = False
@@ -248,6 +277,31 @@ class HarmoniousCurvesEditor:
         self._refresh_visual_style()
         self._reset_slider_widgets()
         self._update_selection_info()
+
+    def _delete_selected_points(self):
+        """删除框选的控制点，保留 >= 4 点，x 轴自动重新编号。"""
+        if not self._selected_points:
+            return
+        # 按曲线分组
+        by_curve = {}
+        for c, p in self._selected_points:
+            by_curve.setdefault(c, []).append(p)
+
+        deleted_any = False
+        for c_idx, p_idxs in by_curve.items():
+            curve = self.curves[c_idx]
+            keep = [i for i in range(len(curve['x'])) if i not in p_idxs]
+            if len(keep) < 4:
+                print(f"  {curve['name']} 删除后不足 4 点，跳过")
+                continue
+            curve['x'] = np.arange(len(keep), dtype=float)
+            curve['y'] = curve['y'][keep]
+            self._update_spline(c_idx)
+            deleted_any = True
+
+        if deleted_any:
+            self._save_current_state()
+        self._clear_selection()
 
     def add_curve(self, x_ctrl, y_ctrl, color='blue', name="Curve"):
         x = np.array(x_ctrl, dtype=float)
@@ -289,6 +343,7 @@ class HarmoniousCurvesEditor:
         self.current_label = "All"
         self._active_curve_idx = None
         self._active_point_idx = None
+        self._tab_index = 0
         self._hide_drop_hint()
         # 重置坐标轴范围，等新数据加载后再自动适配
         self.ax.relim()
@@ -889,8 +944,8 @@ class HarmoniousCurvesEditor:
         prev_state = self.undo_stack[-1]
         for idx, crv in enumerate(self.curves):
             if idx < len(prev_state):
-                crv['x'][:] = prev_state[idx]['x']
-                crv['y'][:] = prev_state[idx]['y']
+                crv['x'] = prev_state[idx]['x'].copy()
+                crv['y'] = prev_state[idx]['y'].copy()
                 self._update_spline(idx)
         self._refresh_visual_style()
         self._reset_slider_widgets()
@@ -906,6 +961,20 @@ class HarmoniousCurvesEditor:
             self._clear_selection()
         elif event.key == 'z':
             self.undo()
+        elif event.key in ('delete', 'backspace'):
+            self._delete_selected_points()
+        elif event.key == 'a':
+            self._tab_index = 0
+            if self.radio_menu and self.radio_labels:
+                self.radio_menu.set_active(0)
+            self.set_active_curve("All")
+        elif event.key == 'tab':
+            if not self.radio_labels:
+                return
+            self._tab_index = (self._tab_index + 1) % len(self.radio_labels)
+            if self.radio_menu:
+                self.radio_menu.set_active(self._tab_index)
+            self.set_active_curve(self.radio_labels[self._tab_index])
 
     def save_curves_npy(self, event=None, filename="adjusted_curves.npy"):
         """兼容旧接口：快速保存为 .npy 到当前目录（按列存储）。"""
