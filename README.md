@@ -1,3 +1,5 @@
+<p align="center"><img src="image.png" width="180"></p>
+
 # CurveMagician
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
