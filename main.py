@@ -109,15 +109,15 @@ class HarmoniousCurvesEditor:
         self._top_dots = None              # 面板顶层圆点 scatter
         self._radio_circles = []           # 面板 Circle patch 列表
         self._color_patches = []           # 面板色块 Rectangle 列表
-
+  
         # 底部状态信息 — 大号数字加粗，描述浅色跟随
         self.info_num = self.fig.text(
-            0.05, 0.02, "", fontsize=14, fontweight='bold',
-            color='#222222', va='bottom', ha='left',
+            0.05, 0.02, "", fontsize=15, fontweight='bold',
+            color='#2e3440', va='bottom', ha='left',
         )
         self.info_tag = self.fig.text(
-            0.15, 0.02, "", fontsize=10, color='#555555',
-            fontweight='bold', va='bottom', ha='left',
+            0.15, 0.02, "", fontsize=10, color='#4c566a',
+            fontweight='normal', va='bottom', ha='left',
         )
 
         # 事件绑定
@@ -671,6 +671,7 @@ class HarmoniousCurvesEditor:
         if self.ax_radio is None:
             return
         self.ax_radio.cla()
+        self.ax_radio.set_facecolor('#fafbfc')
         self.ax_radio.set_xticks([])
         self.ax_radio.set_yticks([])
         self.ax_radio.set_navigate(False)
@@ -687,56 +688,75 @@ class HarmoniousCurvesEditor:
             return
 
         ax = self.ax_radio
+        ax.set_facecolor('#fafbfc')
         base_labels = ["All"] + [self.curves[i]['name'] for i in range(len(curve_colors))]
         num_labels = len(base_labels)
         font_size = 9 if num_labels > 8 else 10
-        activecolor = '#2ca02c'
+        activecolor = '#5e81ac'   # 选中态钢蓝
         active_idx = [0]
 
         ys = np.linspace(1, 0, num_labels + 2)[1:-1]
         dot_radius = 0.022 if num_labels > 8 else 0.030
-        patch_h = 0.55 / num_labels if num_labels > 8 else 0.035
+        patch_h = 0.55 / num_labels if num_labels > 8 else 0.038
+
+        # ── 面板标题 ──
+        ax.text(0.50, 0.97, 'Curves', transform=ax.transAxes,
+                fontsize=11, fontweight='bold', color='#4c566a',
+                ha='center', va='top')
 
         self._radio_circles = []
 
         for i in range(num_labels):
             y = ys[i]
 
+            # 圆点 — 空心 + 选中态填充
             c = Circle(
-                (0.07, y), dot_radius,
+                (0.09, y), dot_radius,
                 transform=ax.transAxes,
                 facecolor='white',
-                edgecolor='black',
-                linewidth=2.0,
+                edgecolor='#a0a8b8',
+                linewidth=1.8,
                 zorder=10,
             )
             ax.add_patch(c)
             self._radio_circles.append(c)
 
+            # 曲线名称
             ax.text(
                 0.42, y, base_labels[i],
                 transform=ax.transAxes,
                 fontsize=font_size,
+                fontweight='bold' if i == 0 else 'normal',
+                color='#4c566a',
                 va='center',
             )
 
             if i == 0:
                 continue
 
+            # 色块 — 圆角视觉 + 柔和边框
             rect = Rectangle(
-                (0.17, y - patch_h / 2), 0.22, patch_h,
+                (0.18, y - patch_h / 2), 0.20, patch_h,
                 facecolor=curve_colors[i - 1],
                 transform=ax.transAxes,
                 zorder=0,
-                edgecolor='#aaaaaa',
-                linewidth=0.5,
+                edgecolor='#d8dee9',
+                linewidth=0.8,
+                alpha=0.85,
             )
             ax.add_patch(rect)
             self._color_patches.append(rect)
 
         def _refresh_dots():
             for i, c in enumerate(self._radio_circles):
-                c.set_facecolor(activecolor if i == active_idx[0] else 'white')
+                if i == active_idx[0]:
+                    c.set_facecolor(activecolor)
+                    c.set_edgecolor('#4c6f99')
+                    c.set_linewidth(2.2)
+                else:
+                    c.set_facecolor('white')
+                    c.set_edgecolor('#a0a8b8')
+                    c.set_linewidth(1.8)
 
         _refresh_dots()
 
@@ -780,7 +800,8 @@ class HarmoniousCurvesEditor:
                 '拖放 CSV / Excel / NPY 文件到此处\n或点击 Open 按钮选择文件',
                 transform=self.ax.transAxes,
                 ha='center', va='center',
-                fontsize=16, color='gray', alpha=0.35,
+                fontsize=15, color='#4c566a', alpha=0.30,
+                fontweight='bold',
                 zorder=100,
             )
         else:
@@ -1161,48 +1182,106 @@ def _make_demo_curves(n_pts=80):
 # ===================== UI 工厂 =====================
 def _build_ui():
     """创建 figure 和所有 axes，返回 (fig, axes_dict)"""
+    # ── 现代柔和配色 ──
+    BG_FIGURE  = '#eceff4'   # 整体背景
+    BG_PLOT    = '#ffffff'   # 主绘图区
+    GRID_COLOR = '#d8dee9'   # 网格线
+    BG_SLIDER  = '#e5e9f0'   # 滑杆轨道底色
+    BG_RADIO   = '#fafbfc'   # 单选面板
+    BG_INPUT   = '#f4f5f8'   # 输入框底色
+
     fig = plt.figure(figsize=(16, 9))
+    fig.patch.set_facecolor(BG_FIGURE)
     fig.canvas.manager.set_window_title("CurveMagician")
 
     ax = {
-        'main':     plt.axes([0.05, 0.10, 0.70, 0.80]),
+        'main':     plt.axes([0.05, 0.10, 0.70, 0.80], facecolor=BG_PLOT),
+        # 左侧操作按钮组：Open | Save | Undo | Fit
         'open':     plt.axes([0.05, 0.94, 0.08, 0.035]),
         'save':     plt.axes([0.14, 0.94, 0.08, 0.035]),
         'undo':     plt.axes([0.23, 0.94, 0.08, 0.035]),
-        'neighbor': plt.axes([0.35, 0.94, 0.11, 0.035]),
-        'fit':      plt.axes([0.47, 0.94, 0.06, 0.035]),
-        'npts':     plt.axes([0.57, 0.94, 0.07, 0.035]),
-        'apply':    plt.axes([0.65, 0.94, 0.08, 0.035]),
-        'scale':    plt.axes([0.80, 0.89, 0.18, 0.040], facecolor='#e0e0e0'),
-        'smooth':   plt.axes([0.80, 0.84, 0.18, 0.040], facecolor='#e0e0e0'),
-        'noise':    plt.axes([0.80, 0.79, 0.18, 0.040], facecolor='#e0e0e0'),
-        'radio':    plt.axes([0.78, 0.08, 0.20, 0.68], facecolor='#fbfbfb'),
+        'fit':      plt.axes([0.32, 0.94, 0.06, 0.035]),
+        # 右侧参数组：+/-N | Points | Resample
+        'neighbor': plt.axes([0.52, 0.94, 0.08, 0.035], facecolor=BG_INPUT),
+        'npts':     plt.axes([0.61, 0.94, 0.07, 0.035], facecolor=BG_INPUT),
+        'apply':    plt.axes([0.69, 0.94, 0.08, 0.035]),
+        'scale':    plt.axes([0.80, 0.89, 0.18, 0.040], facecolor=BG_SLIDER),
+        'smooth':   plt.axes([0.80, 0.84, 0.18, 0.040], facecolor=BG_SLIDER),
+        'noise':    plt.axes([0.80, 0.79, 0.18, 0.040], facecolor=BG_SLIDER),
+        'radio':    plt.axes([0.78, 0.08, 0.20, 0.68], facecolor=BG_RADIO),
     }
-    ax['main'].grid(True, linestyle='--', alpha=0.45)
+
+    # ── 主绘图区美化 ──
+    main_ax = ax['main']
+    main_ax.grid(True, linestyle='-', alpha=0.25, color=GRID_COLOR, linewidth=0.6)
+    main_ax.tick_params(labelsize=9, colors='#4c566a')
+    main_ax.spines['top'].set_visible(False)
+    main_ax.spines['right'].set_visible(False)
+    main_ax.spines['left'].set_color('#d8dee9')
+    main_ax.spines['bottom'].set_color('#d8dee9')
+
+    # ── 其他小 axes 统一隐藏边框 ──
+    for key in ['open', 'save', 'undo', 'fit', 'apply', 'neighbor', 'npts']:
+        _hide_axes_spines(ax[key])
+
     return fig, ax
+
+
+def _hide_axes_spines(axes):
+    """隐藏 axes 的四个边框和刻度"""
+    for spine in axes.spines.values():
+        spine.set_visible(False)
+    axes.set_xticks([])
+    axes.set_yticks([])
 
 
 def _wire_widgets(editor, ax):
     """创建按钮/滑杆/输入框并连接到编辑器"""
+    # ── 按钮配色（Nord 风格） ──
+    C_OPEN   = '#5e81ac'  # 钢蓝
+    C_SAVE   = '#a3be8c'  # 鼠尾草绿
+    C_UNDO   = '#d08770'  # 暖橙
+    C_FIT    = '#b48ead'  # 淡紫
+    C_APPLY  = '#bf616a'  # 珊瑚红
+    C_OPEN_H   = '#4c6f99'
+    C_SAVE_H   = '#8caa72'
+    C_UNDO_H   = '#c0745d'
+    C_FIT_H    = '#a07a99'
+    C_APPLY_H  = '#ad5058'
+
+    # 左侧操作按钮组
+    Button(ax['open'],  'Open',  color=C_OPEN,  hovercolor=C_OPEN_H).on_clicked(editor.on_open_clicked)
+    Button(ax['save'],  'Save',  color=C_SAVE,  hovercolor=C_SAVE_H).on_clicked(editor.save_file)
+    Button(ax['undo'],  'Undo',  color=C_UNDO,  hovercolor=C_UNDO_H).on_clicked(editor.undo)
+    Button(ax['fit'],   'Fit',   color=C_FIT,   hovercolor=C_FIT_H).on_clicked(editor._auto_range_axes)
+
+    # 右侧参数组
     TextBox(ax['neighbor'], "+/-N", initial="0").on_submit(editor.set_neighbor_num)
 
     resample_box = TextBox(ax['npts'], "", initial="")
     editor._resample_box = resample_box
     editor._typing_axes.add(ax['npts'])
-    Button(ax['apply'], 'Resample').on_clicked(editor._do_resample)
+    Button(ax['apply'], 'Resample', color=C_APPLY, hovercolor=C_APPLY_H).on_clicked(editor._do_resample)
 
-    Button(ax['open'], 'Open').on_clicked(editor.on_open_clicked)
-    Button(ax['save'], 'Save').on_clicked(editor.save_file)
-    Button(ax['undo'], 'Undo').on_clicked(editor.undo)
-    Button(ax['fit'], 'Fit').on_clicked(editor._auto_range_axes)
-
+    # ── 滑杆 ──
+    SLIDER_COLOR = '#5e81ac'
     sliders = {
-        'scale':  Slider(ax['scale'],  'Scale ',  0.0, 2.0, valinit=1.0, valfmt='%.2f', color='#4682b4'),
-        'smooth': Slider(ax['smooth'], 'Smooth',  1,   15,  valinit=1,   valfmt='%d',   color='#4682b4'),
-        'noise':  Slider(ax['noise'],  'Noise ',  0.0, 5.0, valinit=0.0, valfmt='%.1f', color='#4682b4'),
+        'scale':  Slider(ax['scale'],  'Scale ',  0.0, 2.0, valinit=1.0, valfmt='%.2f', color=SLIDER_COLOR),
+        'smooth': Slider(ax['smooth'], 'Smooth',  1,   15,  valinit=1,   valfmt='%d',   color=SLIDER_COLOR),
+        'noise':  Slider(ax['noise'],  'Noise ',  0.0, 5.0, valinit=0.0, valfmt='%.1f', color=SLIDER_COLOR),
     }
     for s in sliders.values():
-        s.label.set_size(9)
+        s.label.set_size(10)
+        s.label.set_color('#4c566a')
+        s.label.set_fontweight('bold')
+        s.valtext.set_fontsize(9)
+        s.valtext.set_color('#4c566a')
+        # 滑杆手柄（poly）美化
+        if hasattr(s, 'poly'):
+            s.poly.set_facecolor('#81a1c1')
+            s.poly.set_edgecolor('#5e81ac')
+            s.poly.set_linewidth(1.2)
+
     editor.slider_scale  = sliders['scale']
     editor.slider_smooth = sliders['smooth']
     editor.slider_noise  = sliders['noise']
@@ -1226,9 +1305,9 @@ def _load_demo(editor, colors):
 
 # ===================== 主程序 =====================
 if __name__ == "__main__":
-    COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
-              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
-              '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5']
+    COLORS = ['#5e81ac', '#d08770', '#a3be8c', '#b48ead', '#bf616a',
+              '#ebcb8b', '#81a1c1', '#8fbcbb', '#c9826b', '#7e9e6d',
+              '#6a89cc', '#e55039', '#78e08f', '#6a89cc', '#b8e994']
 
     fig, ax = _build_ui()
     editor = HarmoniousCurvesEditor(

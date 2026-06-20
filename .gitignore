@@ -20,3 +20,6 @@ node_modules/
 # 数据文件（如果不想提交 npy 文件也可以加上）
 *.npy
 *.csv
+
+main_v2.py
+main_qt.py
