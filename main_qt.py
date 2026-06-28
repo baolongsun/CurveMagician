@@ -346,11 +346,12 @@ class HarmoniousCurvesEditor:
             # 3. 默认 All 状态，未进行框选
             total = sum(len(c['y']) for c in self.curves)
             self.info_num.set_text(f"{total} pts")
-            nc, ppc = len(self.curves), len(self.curves[0]['y'])
-            self.info_tag.set_text(f"All ({nc} curves x {ppc})")
-            
-            # 检查是否所有曲线的总长度都相同
+            nc = len(self.curves)
             all_counts = {len(c['y']) for c in self.curves}
+            if len(all_counts) == 1:
+                self.info_tag.set_text(f"All ({nc} curves x {all_counts.pop()})")
+            else:
+                self.info_tag.set_text(f"All ({nc} curves, ragged)")
             current_resample_val = str(all_counts.pop()) if len(all_counts) == 1 else "---"
 
         # 同步输入框：点数一致填数字，不一致填 "---"
@@ -922,38 +923,90 @@ class HarmoniousCurvesEditor:
             raise ValueError(f"不支持的文件格式: {ext}（支持 .csv .xlsx .npy）")
 
     def _load_data_from_file(self, file_path):
+        """加载文件，返回 (curves_list, is_ragged)。
+        curves_list: [[y1,y2,...], ...] 每条曲线一个列表
+        is_ragged: True 表示曲线长度不一致"""
         fmt = self._detect_format(file_path)
 
-        if fmt == 'csv':
-            data = np.loadtxt(file_path, delimiter=',', dtype=float, ndmin=2)
+        if fmt == 'npy':
+            data = np.load(file_path, allow_pickle=True)
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+            if data.ndim != 2:
+                raise ValueError(f"NPY 数据必须是 1D 或 2D，当前 shape: {data.shape}")
+            n_rows, n_cols = data.shape
+            if n_rows < n_cols:
+                data = data.T
+            if data.shape[0] < 4:
+                raise ValueError(f"每条曲线至少需要 4 个采样点，当前仅 {data.shape[0]} 行")
+            return [data[:, i].tolist() for i in range(data.shape[1])], False
+
+        elif fmt == 'csv':
+            # 逐行读取，支持不等长列
+            curves_by_col = []
+            with open(file_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    vals = [float(x) for x in line.split(',') if x.strip()]
+                    for ci, v in enumerate(vals):
+                        while len(curves_by_col) <= ci:
+                            curves_by_col.append([])
+                        curves_by_col[ci].append(v)
+            if not curves_by_col:
+                raise ValueError("CSV 文件为空")
+            # 方向检测：列数 > 每列行数 → 可能需要转置
+            if len(curves_by_col) > max(len(c) for c in curves_by_col):
+                # 每行作为一条曲线
+                curves_by_col = [[r] for r in curves_by_col[0]]
+                # Re-read: each row is a curve
+                with open(file_path, 'r') as f:
+                    curves_by_col = []
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        vals = [float(x) for x in line.split(',') if x.strip()]
+                        if vals:
+                            curves_by_col.append(vals)
+            for c in curves_by_col:
+                if len(c) < 4:
+                    raise ValueError(f"每条曲线至少需要 4 个采样点，当前某曲线仅 {len(c)} 点")
+            is_ragged = len({len(c) for c in curves_by_col}) > 1
+            return curves_by_col, is_ragged
+
         elif fmt == 'excel':
             if not HAS_EXCEL:
                 raise ImportError("读取 Excel 需要 openpyxl: pip install openpyxl")
             wb = load_workbook(file_path, data_only=True)
             ws = wb.active
-            rows = [[cell.value or 0 for cell in row] for row in ws.iter_rows()]
+            rows = [[cell.value for cell in row] for row in ws.iter_rows()]
+            wb.close()
             if not rows:
                 raise ValueError("Excel 文件为空")
-            data = np.array(rows, dtype=float)
-            wb.close()
-        elif fmt == 'npy':
-            data = np.load(file_path, allow_pickle=True)
 
-        if data.ndim == 1:
-            data = data.reshape(-1, 1)
-        if data.ndim != 2:
-            raise ValueError(f"数据必须是 1D 或 2D，当前 shape: {data.shape}")
+            # 逐列读取，只取非空值，不补 0
+            max_cols = max(len(r) for r in rows) if rows else 0
+            curves_by_col = []
+            for ci in range(max_cols):
+                col = [float(r[ci]) for r in rows
+                       if ci < len(r) and r[ci] is not None]
+                if col:
+                    curves_by_col.append(col)
 
-        n_rows, n_cols = data.shape
-        if n_rows < n_cols:
-            data = data.T
-            print(f"  方向检测: {n_rows}行×{n_cols}列 → 自动转置为 {n_cols}点×{n_rows}曲线")
-        elif n_cols < n_rows:
-            print(f"  方向检测: {n_rows}行×{n_cols}列 → 已是列式 ({n_rows}点×{n_cols}曲线)")
+            # 方向检测：列少行多 → 每列是一条曲线；列多行少 → 转置
+            if len(curves_by_col) > sum(len(c) for c in curves_by_col) / len(curves_by_col) * 2:
+                curves_by_col = [[float(v) for v in r if v is not None]
+                                 for r in rows if any(v is not None for v in r)]
 
-        if data.shape[0] < 4:
-            raise ValueError(f"每条曲线至少需要 4 个采样点，当前仅 {data.shape[0]} 行")
-        return data
+            for c in curves_by_col:
+                if len(c) < 4:
+                    raise ValueError(f"每条曲线至少需要 4 个采样点，当前某曲线仅 {len(c)} 点")
+            is_ragged = len({len(c) for c in curves_by_col}) > 1
+            return curves_by_col, is_ragged
+
+        raise ValueError(f"不支持的文件格式: {fmt}")
 
     def load_curves_from_file(self, file_path=None):
         if file_path is None:
@@ -970,7 +1023,7 @@ class HarmoniousCurvesEditor:
                 return
 
         try:
-            data = self._load_data_from_file(file_path)
+            curves_list, is_ragged = self._load_data_from_file(file_path)
         except Exception as e:
             messagebox.showerror("加载错误", f"无法加载文件:\n{e}")
             return
@@ -979,14 +1032,13 @@ class HarmoniousCurvesEditor:
         self._clear_all_curves()
         self._clear_radio_panel()
 
-        n_curves = data.shape[1]
-        n_points = data.shape[0]
         curve_colors = []
-        for idx in range(n_curves):
+        for idx, y_data in enumerate(curves_list):
             color = self.color_list[idx % len(self.color_list)] if self.color_list else f"C{idx}"
             name = f"Curve {idx}"
             curve_colors.append(color)
-            self.add_curve(np.arange(n_points), data[:, idx], color=color, name=name)
+            y_arr = np.array(y_data, dtype=float)
+            self.add_curve(np.arange(len(y_arr)), y_arr, color=color, name=name)
 
         self._build_radio_panel(curve_colors)
         self._auto_range_axes()
@@ -997,15 +1049,38 @@ class HarmoniousCurvesEditor:
 
         fname = basename(file_path)
         self.fig.canvas.manager.set_window_title(f"CurveMagician - {fname}")
-        print(f"已加载 {n_curves} 条曲线 ({n_points} 点/条)，来自 {file_path}")
+        n_curves = len(curves_list)
+        if is_ragged:
+            pts_info = ", ".join(f"{len(c)}" for c in curves_list)
+            print(f"已加载 {n_curves} 条曲线 (不等长: {pts_info})，来自 {file_path}")
+        else:
+            print(f"已加载 {n_curves} 条曲线 ({len(curves_list[0])} 点/条)，来自 {file_path}")
 
     def save_file(self, event=None):
         if not self.curves:
             messagebox.showwarning("保存", "没有曲线数据可保存。")
             return
 
-        default_ext = ".npy"
-        initial_file = "curves.npy"
+        # 检测曲线长度是否一致
+        lengths = [len(c['y']) for c in self.curves]
+        is_ragged = len(set(lengths)) > 1
+
+        if is_ragged:
+            default_ext = ".xlsx"
+            initial_file = "curves.xlsx"
+            filetypes = [
+                ("Excel 文件", "*.xlsx"),
+                ("CSV 文件", "*.csv"),
+            ]
+        else:
+            default_ext = ".npy"
+            initial_file = "curves.npy"
+            filetypes = [
+                ("NumPy 文件", "*.npy"),
+                ("CSV 文件", "*.csv"),
+                ("Excel 文件", "*.xlsx"),
+            ]
+
         if self.current_file_path:
             default_ext = splitext(self.current_file_path)[1]
             initial_file = basename(self.current_file_path)
@@ -1014,36 +1089,56 @@ class HarmoniousCurvesEditor:
             title="保存曲线为",
             initialfile=initial_file,
             defaultextension=default_ext,
-            filetypes=[
-                ("NumPy 文件", "*.npy"),
-                ("CSV 文件", "*.csv"),
-                ("Excel 文件", "*.xlsx"),
-            ]
+            filetypes=filetypes,
         )
         if not file_path:
             return
 
         try:
             fmt = self._detect_format(file_path)
-            data = np.array([curve['y'] for curve in self.curves]).T
 
-            if fmt == 'csv':
-                np.savetxt(file_path, data, delimiter=',', fmt='%.8g')
+            if is_ragged and fmt == 'npy':
+                messagebox.showerror("保存错误",
+                    "曲线长度不一致，无法保存为 NPY。请选择 Excel 或 CSV 格式。")
+                return
+
+            if fmt == 'npy':
+                data = np.array([curve['y'] for curve in self.curves]).T
+                np.save(file_path, data)
+            elif fmt == 'csv':
+                max_len = max(lengths)
+                with open(file_path, 'w') as f:
+                    for row_idx in range(max_len):
+                        row_vals = []
+                        for c in self.curves:
+                            if row_idx < len(c['y']):
+                                row_vals.append(f"{c['y'][row_idx]:.8g}")
+                            else:
+                                row_vals.append("")
+                        f.write(",".join(row_vals) + "\n")
             elif fmt == 'excel':
                 if not HAS_EXCEL:
                     raise ImportError("保存 Excel 需要 openpyxl: pip install openpyxl")
                 wb = Workbook()
                 ws = wb.active
-                for row in data:
-                    ws.append(row.tolist())
+                max_len = max(lengths)
+                for row_idx in range(max_len):
+                    row = []
+                    for c in self.curves:
+                        if row_idx < len(c['y']):
+                            row.append(c['y'][row_idx])
+                        else:
+                            row.append(None)
+                    ws.append(row)
                 wb.save(file_path)
-            elif fmt == 'npy':
-                np.save(file_path, data)
 
             self.current_file_path = file_path
             fname = basename(file_path)
             self.fig.canvas.manager.set_window_title(f"CurveMagician - {fname}")
-            print(f"已保存 {data.shape[1]} 条曲线 ({data.shape[0]} 点/条) 到 {file_path}")
+            if is_ragged:
+                print(f"已保存 {len(self.curves)} 条曲线 (不等长) 到 {file_path}")
+            else:
+                print(f"已保存 {len(self.curves)} 条曲线 ({lengths[0]} 点/条) 到 {file_path}")
         except Exception as e:
             messagebox.showerror("保存错误", f"保存失败:\n{e}")
 
