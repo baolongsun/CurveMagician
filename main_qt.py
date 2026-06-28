@@ -4,9 +4,10 @@ matplotlib.use('TkAgg')
 import numpy as np
 import matplotlib.pyplot as plt
 from os.path import splitext, basename
+from time import perf_counter
 from matplotlib.patches import Rectangle, Circle
 from matplotlib.widgets import AxesWidget, Button, TextBox, Slider
-from scipy.interpolate import splprep, splev
+from scipy.interpolate import splprep, splev, CubicSpline
 from scipy.ndimage import uniform_filter1d
 from tkinter import filedialog, messagebox
 
@@ -61,6 +62,7 @@ class HarmoniousCurvesEditor:
         # 曲线激活锁定（单击选中 + 双击锁定，最终活跃 = 两者并集）
         self.active_curve_indices = set()   # 单击选中的（单个）
         self.locked_curve_indices = set()   # 双击锁定的（多个，独立保留）
+        self.pinned_curve_indices = set()   # Pin 按钮固定：始终高亮，永不被选中/拖拽
         self.current_label = "All"
 
         # 单点拖拽
@@ -82,6 +84,21 @@ class HarmoniousCurvesEditor:
         self._batch_moving = False
         self._batch_origin = None
         self._selection_x_bounds = None
+
+        # Shift+框选 → 可调窗口模式
+        self._adjust_mode = False
+        self._adjust_rect = None        # Rectangle patch
+        self._adjust_handles = []       # 8 个 Rectangle 手柄
+        self._adjust_data = None        # {x0, y0, x1, y1}
+        self._adjust_drag_edge = None   # 'left'|'right'|'top'|'bottom'|'center'|'tl'|'tr'|'bl'|'br'
+        self._adjust_drag_start = None
+        self._shift_selecting = False
+        self._handle_radius = 8         # 手柄命中半径（像素）
+        self._last_motion_time = 0      # motion 节流计时器（秒）
+
+        # 性能：motion 事件节流
+        self._last_motion_time = 0      # 上次处理 motion 的时间（秒）
+        self._motion_interval = 0.030   # 节流间隔 30ms ≈ 33fps
 
         # Undo 栈 & 临时操作状态备份
         self.undo_stack = []
@@ -110,6 +127,7 @@ class HarmoniousCurvesEditor:
         self._top_dots = None              # 面板顶层圆点 scatter
         self._radio_circles = []           # 面板 Circle patch 列表
         self._color_patches = []           # 面板色块 Rectangle 列表
+        self._lock_icons = []              # 面板锁定图标 Text 列表
   
         # 底部状态信息 — 大号数字加粗，描述浅色跟随
         self.info_num = self.fig.text(
@@ -204,6 +222,29 @@ class HarmoniousCurvesEditor:
         self._reset_slider_widgets()
         self._update_selection_info()
 
+    def toggle_pin(self, event=None):
+        """Pin 按钮：将当前活跃曲线固定——始终高亮，但永不被选中/拖拽"""
+        effective = self._get_effective_active()
+        if len(effective) == 0:
+            # 无活跃曲线 → 对所有曲线切换 pin（全 pin 则取消全 pin）
+            if len(self.pinned_curve_indices) == len(self.curves):
+                self.pinned_curve_indices.clear()
+                print("  📌 取消全部固定")
+            else:
+                self.pinned_curve_indices = set(range(len(self.curves)))
+                print(f"  📌 固定全部 {len(self.curves)} 条曲线")
+        else:
+            for idx in effective:
+                if idx in self.pinned_curve_indices:
+                    self.pinned_curve_indices.discard(idx)
+                    print(f"  📌 取消固定 {self.curves[idx]['name']}")
+                else:
+                    self.pinned_curve_indices.add(idx)
+                    print(f"  📌 固定 {self.curves[idx]['name']}")
+        self._refresh_visual_style()
+        self._refresh_radio_panel()
+        self._update_selection_info()
+
     def _update_current_label(self):
         effective = self._get_effective_active()
         if len(effective) == 0:
@@ -215,15 +256,20 @@ class HarmoniousCurvesEditor:
 
     def _refresh_visual_style(self):
         effective = self._get_effective_active()
+        # 预计算：一次遍历分组，避免每曲线重复扫描 _selected_points
+        sel_by_curve = {}
+        for c, p in self._selected_points:
+            sel_by_curve.setdefault(c, []).append(p)
+
         for idx, curve in enumerate(self.curves):
-            is_curve_active = (len(effective) == 0 or idx in effective)
+            is_curve_active = (len(effective) == 0 or idx in effective
+                               or idx in self.pinned_curve_indices)
             if self._selection_x_bounds is not None:
                 curve['ctrl_points'].set_alpha(0.06)
                 curve['spline_line'].set_alpha(0.18)
                 curve['spline_line'].set_linewidth(1.2)
-                has_points_selected = any(c == idx for c, _ in self._selected_points)
-                if is_curve_active and has_points_selected:
-                    sel_p_idxs = [p for c, p in self._selected_points if c == idx]
+                sel_p_idxs = sel_by_curve.get(idx)
+                if is_curve_active and sel_p_idxs:
                     xs_p = curve['x'][sel_p_idxs]
                     ys_p = curve['y'][sel_p_idxs]
                     curve['hl_ctrl_points'].set_data(xs_p, ys_p)
@@ -353,9 +399,302 @@ class HarmoniousCurvesEditor:
         if self._select_rect is not None:
             self._select_rect.remove()
             self._select_rect = None
+        self._exit_adjust_mode()
         self._refresh_visual_style()
         self._reset_slider_widgets()
         self._update_selection_info()
+
+    # ===================== Shift+框选：可调窗口模式 =====================
+
+    def _enter_adjust_mode(self, x0, y0, x1, y1):
+        """进入可调窗口模式：显示橙色虚框 + 8 个拖拽手柄"""
+        self._adjust_mode = True
+        self._adjust_data = {
+            'x0': min(x0, x1), 'y0': min(y0, y1),
+            'x1': max(x0, x1), 'y1': max(y0, y1),
+        }
+        self._adjust_drag_edge = None
+        self._adjust_drag_start = None
+
+        # 橙色虚线矩形
+        d = self._adjust_data
+        self._adjust_rect = Rectangle(
+            (d['x0'], d['y0']), d['x1'] - d['x0'], d['y1'] - d['y0'],
+            fill=True, facecolor='#FF6B35', alpha=0.10,
+            edgecolor='#FF6B35', linestyle=(0, (5, 3)), linewidth=2.2,
+            zorder=50,
+        )
+        self.ax.add_patch(self._adjust_rect)
+
+        # 8 个白色小方手柄
+        self._build_adjust_handles()
+        self._update_adjust_selection_preview()
+        self.canvas.draw_idle()
+
+    def _exit_adjust_mode(self):
+        """退出可调窗口模式，清理所有 adjust 图元"""
+        self._adjust_mode = False
+        self._adjust_drag_edge = None
+        self._adjust_drag_start = None
+        self._shift_selecting = False
+        if self._adjust_rect is not None:
+            self._adjust_rect.remove()
+            self._adjust_rect = None
+        for h in self._adjust_handles:
+            h.remove()
+        self._adjust_handles.clear()
+        self._adjust_data = None
+
+    def _confirm_adjust(self):
+        """确认当前可调窗口 → 固化为最终框选"""
+        if self._adjust_data is None:
+            return
+        d = self._adjust_data
+        self._selection_x_bounds = (d['x0'], d['x1'])
+        self._selected_points = self._select_points_in_rect(
+            d['x0'], d['y0'], d['x1'], d['y1'])
+        self._exit_adjust_mode()
+        self._refresh_visual_style()
+        self._update_selection_info()
+        print(f"  ✓ 窗口确认 — 选中 {len(self._selected_points)} 个控制点")
+
+    def _cancel_adjust(self):
+        """取消可调窗口"""
+        self._exit_adjust_mode()
+        self._selection_x_bounds = None
+        self._selected_points.clear()
+        self._refresh_visual_style()
+        self._update_selection_info()
+        print("  ✗ 窗口取消")
+
+    def _build_adjust_handles(self):
+        """在 adjust 矩形四角 + 四边中点创建手柄"""
+        for h in self._adjust_handles:
+            h.remove()
+        self._adjust_handles.clear()
+
+        d = self._adjust_data
+        x0, y0, x1, y1 = d['x0'], d['y0'], d['x1'], d['y1']
+        xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+
+        hw, hh = self._handle_size_data()
+        positions = {
+            'bl': (x0, y0), 'bm': (xm, y0), 'br': (x1, y0),
+            'ml': (x0, ym), 'mr': (x1, ym),
+            'tl': (x0, y1), 'tm': (xm, y1), 'tr': (x1, y1),
+        }
+        for key, (hx, hy) in positions.items():
+            rect = Rectangle(
+                (hx - hw / 2, hy - hh / 2), hw, hh,
+                facecolor='white', edgecolor='#FF6B35',
+                linewidth=2.0, zorder=55,
+            )
+            self.ax.add_patch(rect)
+            self._adjust_handles.append(rect)
+
+    def _handle_size_data(self):
+        """返回手柄在数据坐标中的半宽/半高（约 _handle_radius 像素）"""
+        bbox = self.ax.get_window_extent()
+        if bbox is None:
+            return 0.02, 0.02
+        px_w, px_h = bbox.width, bbox.height
+        xl = self.ax.get_xlim()
+        yl = self.ax.get_ylim()
+        w_data = max(xl[1] - xl[0], 1e-9)
+        h_data = max(yl[1] - yl[0], 1e-9)
+        return (self._handle_radius * w_data / px_w,
+                self._handle_radius * h_data / px_h)
+
+    def _get_data_coords(self, event):
+        """获取主图数据坐标。主图内用 event 坐标（精确），跨 axes 用 figure 回退"""
+        # 鼠标在主图 axes 内 → 直接取，精度最高
+        if hasattr(event, 'inaxes') and event.inaxes == self.ax:
+            if event.xdata is not None and event.ydata is not None:
+                return event.xdata, event.ydata
+        
+        # 鼠标跨到滑杆/面板/外部 → 从全局像素坐标（event.x, event.y）直接反推
+        if event.x is not None and event.y is not None:
+            try:
+                # 传入真实的像素点 (event.x, event.y)，直接逆变换到数据坐标
+                return self.ax.transData.inverted().transform([(event.x, event.y)])[0]
+            except Exception:
+                pass
+                
+        return event.xdata, event.ydata
+
+    def _handle_adjust_drag(self, event):
+        """根据 _adjust_drag_edge 拖拽调整窗口大小或移动（30ms 节流，支持出界）"""
+        if self._adjust_data is None or self._adjust_drag_start is None:
+            return
+
+        now = perf_counter()
+        if now - self._last_motion_time < 0.030:
+            return
+        self._last_motion_time = now
+
+        xd, yd = self._get_data_coords(event)
+        if xd is None or yd is None:
+            return
+
+        d = self._adjust_data
+        dx = xd - self._adjust_drag_start[0]
+        dy = yd - self._adjust_drag_start[1]
+        edge = self._adjust_drag_edge
+        x0, y0, x1, y1 = d['x0'], d['y0'], d['x1'], d['y1']
+
+        # 用 np.nextafter 保证 y0<y1, x0<x1 永不翻转 — 零魔数，适配任意量级
+        if edge == 'center':
+            d['x0'] += dx; d['x1'] += dx
+            d['y0'] += dy; d['y1'] += dy
+        elif 'l' in edge or edge in ('left',):
+            d['x0'] = min(x0 + dx, np.nextafter(x1, -np.inf))
+        elif 'r' in edge or edge in ('right',):
+            d['x1'] = max(x1 + dx, np.nextafter(x0, np.inf))
+        if 't' in edge or edge in ('top',):
+            d['y1'] = max(y1 + dy, np.nextafter(y0, np.inf))
+        if 'b' in edge or edge in ('bottom',):
+            d['y0'] = min(y0 + dy, np.nextafter(y1, -np.inf))
+
+        self._adjust_drag_start = (xd, yd)
+
+        self._rebuild_adjust_ui()
+        self._adjust_frame_update()
+        self.canvas.draw_idle()
+
+    def _rebuild_adjust_ui(self):
+        """刷新 adjust 矩形和手柄的位置（原地更新，不删除重建）"""
+        if self._adjust_data is None or self._adjust_rect is None:
+            return
+        d = self._adjust_data
+        self._adjust_rect.set_xy((d['x0'], d['y0']))
+        self._adjust_rect.set_width(d['x1'] - d['x0'])
+        self._adjust_rect.set_height(d['y1'] - d['y0'])
+
+        # 原地更新 8 个手柄位置，不删除重建
+        if not self._adjust_handles:
+            self._build_adjust_handles()
+            return
+        x0, y0, x1, y1 = d['x0'], d['y0'], d['x1'], d['y1']
+        xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+        hw, hh = self._handle_size_data()
+        new_positions = [
+            (x0, y0), (xm, y0), (x1, y0),
+            (x0, ym), (x1, ym),
+            (x0, y1), (xm, y1), (x1, y1),
+        ]
+        for rect, (hx, hy) in zip(self._adjust_handles, new_positions):
+            rect.set_xy((hx - hw / 2, hy - hh / 2))
+            rect.set_width(hw)
+            rect.set_height(hh)
+
+    def _detect_adjust_interaction(self, event):
+        """返回点击命中的手柄 key，或 'center' / 'outside' / None"""
+        if not self._adjust_mode or self._adjust_data is None:
+            return None
+        if event.xdata is None or event.ydata is None:
+            return None
+
+        d = self._adjust_data
+        x0, y0, x1, y1 = d['x0'], d['y0'], d['x1'], d['y1']
+        xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+
+        # 在显示坐标中做命中检测（固定像素半径）
+        trans = self.ax.transData
+        cx, cy = trans.transform((event.xdata, event.ydata))
+        r = self._handle_radius
+
+        handles = {
+            'bl': trans.transform((x0, y0)), 'bm': trans.transform((xm, y0)),
+            'br': trans.transform((x1, y0)), 'ml': trans.transform((x0, ym)),
+            'mr': trans.transform((x1, ym)), 'tl': trans.transform((x0, y1)),
+            'tm': trans.transform((xm, y1)), 'tr': trans.transform((x1, y1)),
+        }
+
+        for key, (hx, hy) in handles.items():
+            if abs(cx - hx) <= r and abs(cy - hy) <= r:
+                return key
+
+        # 边缘检测（左/右/上/下）
+        left_x = handles['bl'][0]
+        right_x = handles['br'][0]
+        top_y = handles['tl'][1]
+        bottom_y = handles['bl'][1]
+
+        if abs(cx - left_x) <= r and bottom_y + r < cy < top_y - r:
+            return 'left'
+        if abs(cx - right_x) <= r and bottom_y + r < cy < top_y - r:
+            return 'right'
+        if abs(cy - top_y) <= r and left_x + r < cx < right_x - r:
+            return 'top'
+        if abs(cy - bottom_y) <= r and left_x + r < cx < right_x - r:
+            return 'bottom'
+
+        # 矩形内部
+        if x0 < event.xdata < x1 and y0 < event.ydata < y1:
+            return 'center'
+
+        return 'outside'
+
+    def _update_adjust_selection_preview(self):
+        """根据当前 adjust 窗口实时更新选中预览"""
+        if self._adjust_data is None:
+            return
+        d = self._adjust_data
+        self._selection_x_bounds = (d['x0'], d['x1'])
+        self._selected_points = self._select_points_in_rect(
+            d['x0'], d['y0'], d['x1'], d['y1'])
+        self._refresh_visual_style()
+        self._update_selection_info()
+
+    def _adjust_frame_update(self):
+        """adjust 拖拽每帧专用：只更新高亮图元 + 计数，不碰 16 条曲线的基础属性"""
+        if self._adjust_data is None:
+            return
+        d = self._adjust_data
+        self._selection_x_bounds = (d['x0'], d['x1'])
+        self._selected_points = self._select_points_in_rect(
+            d['x0'], d['y0'], d['x1'], d['y1'])
+
+        # 预计算选中点按曲线分组（一次遍历）
+        sel_by_curve = {}
+        for c, p in self._selected_points:
+            sel_by_curve.setdefault(c, []).append(p)
+
+        effective = self._get_effective_active()
+
+        for idx, curve in enumerate(self.curves):
+            is_curve_active = (len(effective) == 0 or idx in effective
+                               or idx in self.pinned_curve_indices)
+            sel_p_idxs = sel_by_curve.get(idx)
+
+            if is_curve_active and sel_p_idxs:
+                xs_p = curve['x'][sel_p_idxs]
+                ys_p = curve['y'][sel_p_idxs]
+                curve['hl_ctrl_points'].set_data(xs_p, ys_p)
+                curve['hl_ctrl_points'].set_alpha(1.0)
+                curve['hl_ctrl_points'].set_markersize(7)
+
+                x_fine, y_fine = curve['fine_x_full'], curve['fine_y_full']
+                xmin, xmax = self._selection_x_bounds
+                mask = (x_fine >= xmin) & (x_fine <= xmax)
+                if np.any(mask):
+                    curve['hl_spline_line'].set_data(x_fine[mask], y_fine[mask])
+                    curve['hl_spline_line'].set_alpha(1.0)
+                    curve['hl_spline_line'].set_linewidth(4.0)
+                else:
+                    curve['hl_spline_line'].set_data([], [])
+            else:
+                curve['hl_spline_line'].set_data([], [])
+                curve['hl_ctrl_points'].set_data([], [])
+
+        # 轻量更新底部计数（不调 _update_selection_info 避免重复遍历 + _draw_idle）
+        n = len(self._selected_points)
+        self.info_num.set_text(f"{n} pts")
+        if sel_by_curve:
+            detail = ", ".join(f"C{c}: {len(p_)}p" for c, p_ in sorted(sel_by_curve.items()))
+            self.info_tag.set_text(f"Adjusting  ({detail})")
+        else:
+            self.info_tag.set_text("Adjusting...")
 
     def _delete_selected_points(self):
         if not self._selected_points:
@@ -515,6 +854,7 @@ class HarmoniousCurvesEditor:
         self._slider_base_state = None
         self.active_curve_indices = set()
         self.locked_curve_indices = set()
+        self.pinned_curve_indices = set()
         self.current_label = "All"
         self._active_curve_idx = None
         self._active_point_idx = None
@@ -725,6 +1065,7 @@ class HarmoniousCurvesEditor:
         self._top_dots = None
         self._radio_circles.clear()
         self._color_patches.clear()
+        self._lock_icons.clear()
         self.radio_menu = None
         self.radio_labels = []
 
@@ -742,7 +1083,7 @@ class HarmoniousCurvesEditor:
         self._radio_ys = np.linspace(1, 0, num_labels + 2)[1:-1]
         self._radio_labels = base_labels
         self._radio_colors = ['#2E86DE'] + list(curve_colors)  # All 用亮蓝
-        dot_radius = 0.022 if num_labels > 8 else 0.030
+        dot_radius = 0.028 if num_labels > 8 else 0.035
         patch_h = 0.55 / num_labels if num_labels > 8 else 0.038
 
         # ── 面板标题 ──
@@ -751,7 +1092,13 @@ class HarmoniousCurvesEditor:
                 ha='center', va='top')
 
         self._radio_circles = []
+        self._lock_icons = []
         self._color_patches.clear()
+
+        # 断开旧的 radio click handler，避免重复注册互相抵消
+        if hasattr(self, '_radio_click_cid') and self._radio_click_cid is not None:
+            self.fig.canvas.mpl_disconnect(self._radio_click_cid)
+            self._radio_click_cid = None
 
         for i in range(num_labels):
             y = self._radio_ys[i]
@@ -767,6 +1114,16 @@ class HarmoniousCurvesEditor:
             )
             ax.add_patch(c)
             self._radio_circles.append(c)
+
+            # 锁图标 — checkbox 中心，初始隐藏，用 emoji 字体
+            icon = ax.text(
+                0.06 + dot_radius, y, '',
+                transform=ax.transAxes,
+                fontsize=font_size + 10, fontfamily='Segoe UI Emoji',
+                ha='center', va='center',
+                zorder=15, visible=False,
+            )
+            self._lock_icons.append(icon)
 
             # 曲线名称
             ax.text(
@@ -805,13 +1162,13 @@ class HarmoniousCurvesEditor:
             dists = np.abs(self._radio_ys - event.ydata)
             closest = int(np.argmin(dists))
             if dists[closest] < 0.8 / num_labels:
-                # 双击 → toggle 锁定；单击 → 单选替换
                 if event.dblclick:
                     self.toggle_active_curve(self._radio_labels[closest])
                 else:
                     self.set_active_curve(self._radio_labels[closest])
 
-        self.fig.canvas.mpl_connect('button_press_event', _on_radio_click)
+        self._radio_click_cid = self.fig.canvas.mpl_connect(
+            'button_press_event', _on_radio_click)
 
     def _refresh_radio_panel(self):
         """更新 checkbox 状态：实心=单击选中，边框加粗+对勾=双击锁定"""
@@ -823,21 +1180,35 @@ class HarmoniousCurvesEditor:
             if i == 0:
                 checked = is_all
                 locked = False
+                pinned = False
             else:
                 checked = (i - 1) in self.active_curve_indices
                 locked = (i - 1) in self.locked_curve_indices
-            if locked:
+                pinned = (i - 1) in self.pinned_curve_indices
+            if pinned or locked or checked:
                 c.set_facecolor(self._radio_colors[i])
-                c.set_edgecolor('#E44C3C')
-                c.set_linewidth(3.0)
-            elif checked:
-                c.set_facecolor(self._radio_colors[i])
-                c.set_edgecolor('#1e6fc0')
                 c.set_linewidth(2.5)
+                if pinned or locked:
+                    c.set_edgecolor('#555')     # 统一暗边框
+                else:
+                    c.set_edgecolor('#1e6fc0')
             else:
                 c.set_facecolor('white')
                 c.set_edgecolor('#9098a8')
                 c.set_linewidth(2.0)
+
+        # 更新图标 — 🔒 = 锁定  📌 = 固定
+        for i, icon in enumerate(self._lock_icons):
+            if i == 0:
+                icon.set_visible(False)
+            elif (i - 1) in self.pinned_curve_indices:
+                icon.set_text('\U0001F4CC'); icon.set_visible(True)
+            elif (i - 1) in self.locked_curve_indices:
+                icon.set_text('\U0001F512'); icon.set_visible(True)
+            elif (i - 1) in self.active_curve_indices:
+                icon.set_visible(False)
+            else:
+                icon.set_visible(False)
         self.fig.canvas.draw_idle()
 
     # ===================== 拖拽支持 =====================
@@ -915,7 +1286,7 @@ class HarmoniousCurvesEditor:
     def on_press(self, event):
         if self._is_toolbar_active():
             return
-        
+
         if not hasattr(event, 'inaxes') or event.inaxes is None:
             return
 
@@ -932,7 +1303,29 @@ class HarmoniousCurvesEditor:
         if event.inaxes != self.ax:
             return
 
+        # ── 可调窗口模式下的交互 ──
+        if self._adjust_mode and event.button == 1:
+            # 双击矩形内部 → 确认
+            if getattr(event, 'dblclick', False):
+                edge = self._detect_adjust_interaction(event)
+                if edge in ('center', 'left', 'right', 'top', 'bottom',
+                            'tl', 'tr', 'bl', 'br', 'tm', 'bm', 'ml', 'mr'):
+                    self._confirm_adjust()
+                    return
+            edge = self._detect_adjust_interaction(event)
+            if edge == 'outside':
+                self._cancel_adjust()
+                return
+            if edge is not None:
+                self._adjust_drag_edge = edge
+                self._adjust_drag_start = (event.xdata, event.ydata)
+                return
+            return
+
         if event.button == 3:
+            if self._adjust_mode:
+                self._cancel_adjust()
+                return
             self._clear_selection()
             return
         if event.button == 1:
@@ -950,8 +1343,10 @@ class HarmoniousCurvesEditor:
                 self.curves[c_idx]['ctrl_points'].set_alpha(1.0)
                 self.canvas.draw_idle()
                 return
+            # 普通框选 / Shift 框选
             self._selecting = True
             self._select_start = (event.xdata, event.ydata)
+            self._shift_selecting = (hasattr(event, 'key') and event.key == 'shift')
             self._select_rect = Rectangle(self._select_start, 0, 0, fill=True, alpha=0.2, color='gray')
             self.ax.add_patch(self._select_rect)
 
@@ -959,7 +1354,12 @@ class HarmoniousCurvesEditor:
         if self._is_toolbar_active():
             return
         if self._is_sliding:
-            return  
+            return
+
+        # ── 可调窗口拖拽：必须在 axes 检查之前，因为上下拖拽容易出界 ──
+        if self._adjust_mode and self._adjust_drag_edge is not None:
+            self._handle_adjust_drag(event)
+            return
 
         if not hasattr(event, 'inaxes') or event.inaxes != self.ax or event.ydata is None:
             return
@@ -998,14 +1398,30 @@ class HarmoniousCurvesEditor:
             self._refresh_visual_style()
 
     def on_release(self, event):
+        # ── 可调窗口拖拽手柄松手 — 停止拖拽但保持 adjust 模式 ──
+        if self._adjust_mode and self._adjust_drag_edge is not None:
+            self._adjust_drag_edge = None
+            self._adjust_drag_start = None
+            return
+
         if self._selecting:
             self._selecting = False
+            was_shift = self._shift_selecting
+            self._shift_selecting = False
             if (self._select_start and event.xdata is not None and event.ydata is not None):
                 x0, y0 = self._select_start
                 x1, y1 = event.xdata, event.ydata
-                self._selection_x_bounds = (min(x0, x1), max(x0, x1))
-                self._selected_points = self._select_points_in_rect(x0, y0, x1, y1)
-                self._refresh_visual_style()
+                if was_shift:
+                    # Shift+框选 → 进入可调窗口模式，先清理拖拽矩形
+                    if self._select_rect is not None:
+                        self._select_rect.remove()
+                        self._select_rect = None
+                    self._enter_adjust_mode(x0, y0, x1, y1)
+                    return
+                else:
+                    self._selection_x_bounds = (min(x0, x1), max(x0, x1))
+                    self._selected_points = self._select_points_in_rect(x0, y0, x1, y1)
+                    self._refresh_visual_style()
             if self._select_rect is not None:
                 self._select_rect.remove()
                 self._select_rect = None
@@ -1054,6 +1470,10 @@ class HarmoniousCurvesEditor:
             candidates = sorted(effective)
         else:
             candidates = list(range(len(self.curves)))
+        # 排除 pinned 曲线 — 永不被选中/拖拽
+        candidates = [c for c in candidates if c not in self.pinned_curve_indices]
+        if not candidates:
+            return None, None
         min_dist = float('inf')
         closest_curve, closest_point = None, None
         for c_idx in candidates:
@@ -1078,11 +1498,15 @@ class HarmoniousCurvesEditor:
             curves_to_check = [(i, self.curves[i]) for i in sorted(effective)]
         else:
             curves_to_check = list(enumerate(self.curves))
+        # 排除 pinned 曲线 — 永不被框选
+        curves_to_check = [(c, crv) for c, crv in curves_to_check
+                           if c not in self.pinned_curve_indices]
         for c_idx, curve in curves_to_check:
             xs, ys = curve['x'], curve['y']
-            for p_idx, (px, py) in enumerate(zip(xs, ys)):
-                if xmin <= px <= xmax and ymin <= py <= ymax:
-                    selected.append((c_idx, p_idx))
+            # numpy 矢量化 — 对 300 点一枪头判定，避免 Python 逐点循环
+            mask = (xs >= xmin) & (xs <= xmax) & (ys >= ymin) & (ys <= ymax)
+            for p_idx in np.flatnonzero(mask):
+                selected.append((c_idx, int(p_idx)))
         return selected
 
     def _get_linked_point_indices(self, total_len, center_idx):
@@ -1115,6 +1539,17 @@ class HarmoniousCurvesEditor:
         self._reset_slider_widgets()
 
     def on_key(self, event):
+        # ── 可调窗口模式下的键盘操作 ──
+        if self._adjust_mode:
+            if event.key == 'escape':
+                self._cancel_adjust()
+                return
+            if event.key == 'enter':
+                self._confirm_adjust()
+                return
+            # adjust 模式下屏蔽其他按键
+            return
+
         if event.key == 's':
             self.save_file()
         elif event.key == 'o':
@@ -1170,13 +1605,19 @@ class HarmoniousCurvesEditor:
         targets = {}
         if self._selected_points:
             for c_idx, p_idx in self._selected_points:
+                if c_idx in self.pinned_curve_indices:
+                    continue
                 if len(effective) == 0 or c_idx in effective:
                     targets.setdefault(c_idx, []).append(p_idx)
         elif len(effective) > 0:
             for c_idx in sorted(effective):
+                if c_idx in self.pinned_curve_indices:
+                    continue
                 targets[c_idx] = list(range(len(self.curves[c_idx]['y'])))
         else:
             for c_idx in range(len(self.curves)):
+                if c_idx in self.pinned_curve_indices:
+                    continue
                 targets[c_idx] = list(range(len(self.curves[c_idx]['y'])))
         return targets
 
@@ -1252,6 +1693,7 @@ def _build_ui():
         'save':     plt.axes([0.14, 0.94, 0.08, 0.035]),
         'undo':     plt.axes([0.23, 0.94, 0.08, 0.035]),
         'fit':      plt.axes([0.32, 0.94, 0.06, 0.035]),
+        'pin':      plt.axes([0.39, 0.94, 0.06, 0.035]),
         # 右侧参数组：+/-N | Points | Resample
         'neighbor': plt.axes([0.52, 0.94, 0.08, 0.035], facecolor=BG_INPUT),
         'npts':     plt.axes([0.61, 0.94, 0.07, 0.035], facecolor=BG_INPUT),
@@ -1272,7 +1714,7 @@ def _build_ui():
     main_ax.spines['bottom'].set_color('#b0b8c4')
 
     # ── 其他小 axes 统一隐藏边框 ──
-    for key in ['open', 'save', 'undo', 'fit', 'apply', 'neighbor', 'npts']:
+    for key in ['open', 'save', 'undo', 'fit', 'pin', 'apply', 'neighbor', 'npts']:
         _hide_axes_spines(ax[key])
 
     return fig, ax
@@ -1299,12 +1741,15 @@ def _wire_widgets(editor, ax):
     C_UNDO_H   = '#d04a1c'
     C_FIT_H    = '#753894'
     C_APPLY_H  = '#c83a2c'
+    C_PIN      = '#00B894'  # 青绿
+    C_PIN_H    = '#009976'
 
     # 左侧操作按钮组
     Button(ax['open'],  'Open',  color=C_OPEN,  hovercolor=C_OPEN_H).on_clicked(editor.on_open_clicked)
     Button(ax['save'],  'Save',  color=C_SAVE,  hovercolor=C_SAVE_H).on_clicked(editor.save_file)
     Button(ax['undo'],  'Undo',  color=C_UNDO,  hovercolor=C_UNDO_H).on_clicked(editor.undo)
     Button(ax['fit'],   'Fit',   color=C_FIT,   hovercolor=C_FIT_H).on_clicked(editor._auto_range_axes)
+    Button(ax['pin'],   'Pin',   color=C_PIN,   hovercolor=C_PIN_H).on_clicked(editor.toggle_pin)
 
     # 右侧参数组
     TextBox(ax['neighbor'], "+/-N", initial="0").on_submit(editor.set_neighbor_num)
