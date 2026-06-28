@@ -58,9 +58,8 @@ class HarmoniousCurvesEditor:
         self.canvas = ax.figure.canvas
         self.curves = []
 
-        # 曲线激活锁定（单击选中 + 双击锁定，最终活跃 = 两者并集）
-        self.active_curve_indices = set()   # 单击选中的（单个）
-        self.locked_curve_indices = set()   # 双击锁定的（多个，独立保留）
+        # 曲线激活锁定
+        self.active_curve_idx = None
         self.current_label = "All"
 
         # 单点拖拽
@@ -110,15 +109,15 @@ class HarmoniousCurvesEditor:
         self._top_dots = None              # 面板顶层圆点 scatter
         self._radio_circles = []           # 面板 Circle patch 列表
         self._color_patches = []           # 面板色块 Rectangle 列表
-  
+
         # 底部状态信息 — 大号数字加粗，描述浅色跟随
         self.info_num = self.fig.text(
-            0.05, 0.02, "", fontsize=15, fontweight='bold',
-            color='#2e3440', va='bottom', ha='left',
+            0.05, 0.02, "", fontsize=14, fontweight='bold',
+            color='#222222', va='bottom', ha='left',
         )
         self.info_tag = self.fig.text(
-            0.15, 0.02, "", fontsize=10, color='#4c566a',
-            fontweight='normal', va='bottom', ha='left',
+            0.15, 0.02, "", fontsize=10, color='#555555',
+            fontweight='bold', va='bottom', ha='left',
         )
 
         # 事件绑定
@@ -158,65 +157,28 @@ class HarmoniousCurvesEditor:
         if c_idx is None:
             return
         target_label = f"Curve {c_idx}"
-        if target_label in self.radio_labels:
-            self.toggle_active_curve(target_label)
-
-    def _get_effective_active(self):
-        """返回当前活跃的曲线集合 = 单击选中 ∪ 双击锁定"""
-        return self.active_curve_indices | self.locked_curve_indices
+        if self.radio_menu and target_label in self.radio_labels:
+            self.radio_menu.set_active(self.radio_labels.index(target_label))
+            self.set_active_curve(target_label)
 
     def set_active_curve(self, label):
-        """单击：设置单选曲线（替换之前单击的，不影响锁定的）。All = 清空单击选中"""
+        self.current_label = label
         if label == "All":
-            self.active_curve_indices = set()
+            self.active_curve_idx = None
         else:
             for idx, curve in enumerate(self.curves):
                 if curve['name'] == label:
-                    self.active_curve_indices = {idx}
-                    break
-        self._update_current_label()
-        effective = self._get_effective_active()
-        if self._selected_points and len(effective) > 0:
-            self._selected_points = [(c, p) for c, p in self._selected_points if c in effective]
-        self._refresh_radio_panel()
+                    self.active_curve_idx = idx
+        if self._selected_points and label != "All":
+            valid_points = [(c, p) for c, p in self._selected_points if c == self.active_curve_idx]
+            self._selected_points = valid_points
         self._refresh_visual_style()
         self._reset_slider_widgets()
         self._update_selection_info()
-
-    def toggle_active_curve(self, label):
-        """双击：锁定/解锁曲线（toggle，独立保留，不影响单击选中）。All = 清空所有锁定"""
-        if label == "All":
-            self.locked_curve_indices = set()
-        else:
-            for idx, curve in enumerate(self.curves):
-                if curve['name'] == label:
-                    if idx in self.locked_curve_indices:
-                        self.locked_curve_indices.discard(idx)
-                    else:
-                        self.locked_curve_indices.add(idx)
-                    break
-        self._update_current_label()
-        effective = self._get_effective_active()
-        if self._selected_points and len(effective) > 0:
-            self._selected_points = [(c, p) for c, p in self._selected_points if c in effective]
-        self._refresh_radio_panel()
-        self._refresh_visual_style()
-        self._reset_slider_widgets()
-        self._update_selection_info()
-
-    def _update_current_label(self):
-        effective = self._get_effective_active()
-        if len(effective) == 0:
-            self.current_label = "All"
-        elif len(effective) == 1:
-            self.current_label = self.curves[next(iter(effective))]['name']
-        else:
-            self.current_label = f"{len(effective)} curves"
 
     def _refresh_visual_style(self):
-        effective = self._get_effective_active()
         for idx, curve in enumerate(self.curves):
-            is_curve_active = (len(effective) == 0 or idx in effective)
+            is_curve_active = (self.active_curve_idx is None or idx == self.active_curve_idx)
             if self._selection_x_bounds is not None:
                 curve['ctrl_points'].set_alpha(0.02)
                 curve['spline_line'].set_alpha(0.1)
@@ -245,10 +207,9 @@ class HarmoniousCurvesEditor:
                 curve['hl_spline_line'].set_data([], [])
                 curve['hl_ctrl_points'].set_data([], [])
                 if is_curve_active:
-                    is_all = len(effective) == 0
-                    alpha_ctrl = 0.3 if is_all else 0.8
-                    lw = 2.0 if is_all else 3.5
-                    ms = 4 if is_all else 6
+                    alpha_ctrl = 0.3 if self.active_curve_idx is None else 0.8
+                    lw = 2.0 if self.active_curve_idx is None else 3.5
+                    ms = 4 if self.active_curve_idx is None else 6
                     curve['ctrl_points'].set_alpha(alpha_ctrl)
                     curve['ctrl_points'].set_markersize(ms)
                     curve['spline_line'].set_alpha(1.0)
@@ -288,14 +249,12 @@ class HarmoniousCurvesEditor:
             else:
                 current_resample_val = "---"  # 不一致则显示占位符，提示输入
 
-        elif len(self._get_effective_active()) > 0:
-            # 2. 未框选，但选中了若干条曲线
-            active_indices = sorted(self._get_effective_active())
-            total = sum(len(self.curves[i]['y']) for i in active_indices)
-            self.info_num.set_text(f"{total} pts")
+        elif self.active_curve_idx is not None:
+            # 2. 未框选，但单选了某一条曲线
+            n = len(self.curves[self.active_curve_idx]['y'])
+            self.info_num.set_text(f"{n} pts")
             self.info_tag.set_text(f"{self.current_label}")
-            counts = {len(self.curves[i]['y']) for i in active_indices}
-            current_resample_val = str(counts.pop()) if len(counts) == 1 else "---"
+            current_resample_val = str(n)
         else:
             # 3. 默认 All 状态，未进行框选
             total = sum(len(c['y']) for c in self.curves)
@@ -327,14 +286,12 @@ class HarmoniousCurvesEditor:
         try:
             canvas_widget = self.fig.canvas.get_tk_widget()
             def _on_tk_tab(event):
-                if not self.radio_labels or len(self.curves) == 0:
+                if not self.radio_labels:
                     return
-                # Tab 在 All → Curve 0 → Curve 1 → ... 之间单选切换
-                self._tab_index = (self._tab_index + 1) % (len(self.curves) + 1)
-                if self._tab_index == 0:
-                    self.set_active_curve("All")
-                else:
-                    self.set_active_curve(self.curves[self._tab_index - 1]['name'])
+                self._tab_index = (self._tab_index + 1) % len(self.radio_labels)
+                if self.radio_menu:
+                    self.radio_menu.set_active(self._tab_index)
+                self.set_active_curve(self.radio_labels[self._tab_index])
                 return 'break'
             canvas_widget.bind('<Tab>', _on_tk_tab)
         except Exception:
@@ -395,14 +352,13 @@ class HarmoniousCurvesEditor:
             return
 
         # 1. 确定当前哪些曲线和哪些点将被作为目标处理
-        effective = self._get_effective_active()
         by_curve = {}
         if self._selected_points:
             for c, p in self._selected_points:
-                if len(effective) == 0 or c in effective:
+                if self.active_curve_idx is None or c == self.active_curve_idx:
                     by_curve.setdefault(c, []).append(p)
         else:
-            targets = sorted(effective) if len(effective) > 0 else list(range(len(self.curves)))
+            targets = [self.active_curve_idx] if self.active_curve_idx is not None else list(range(len(self.curves)))
             for c in targets:
                 by_curve[c] = list(range(len(self.curves[c]['y'])))
 
@@ -513,8 +469,7 @@ class HarmoniousCurvesEditor:
         self._batch_moving = False
         self._selection_x_bounds = None
         self._slider_base_state = None
-        self.active_curve_indices = set()
-        self.locked_curve_indices = set()
+        self.active_curve_idx = None
         self.current_label = "All"
         self._active_curve_idx = None
         self._active_point_idx = None
@@ -716,7 +671,6 @@ class HarmoniousCurvesEditor:
         if self.ax_radio is None:
             return
         self.ax_radio.cla()
-        self.ax_radio.set_facecolor('#fafbfc')
         self.ax_radio.set_xticks([])
         self.ax_radio.set_yticks([])
         self.ax_radio.set_navigate(False)
@@ -729,116 +683,93 @@ class HarmoniousCurvesEditor:
         self.radio_labels = []
 
     def _build_radio_panel(self, curve_colors):
-        """构建多选 checkbox 面板：All + 各曲线，点击 toggle 勾选"""
         if self.ax_radio is None:
             return
 
         ax = self.ax_radio
-        ax.set_facecolor('#fafbfc')
         base_labels = ["All"] + [self.curves[i]['name'] for i in range(len(curve_colors))]
         num_labels = len(base_labels)
         font_size = 9 if num_labels > 8 else 10
+        activecolor = '#2ca02c'
+        active_idx = [0]
 
-        self._radio_ys = np.linspace(1, 0, num_labels + 2)[1:-1]
-        self._radio_labels = base_labels
-        self._radio_colors = ['#5e81ac'] + list(curve_colors)  # All 用钢蓝
+        ys = np.linspace(1, 0, num_labels + 2)[1:-1]
         dot_radius = 0.022 if num_labels > 8 else 0.030
-        patch_h = 0.55 / num_labels if num_labels > 8 else 0.038
-
-        # ── 面板标题 ──
-        ax.text(0.50, 0.97, 'Curves', transform=ax.transAxes,
-                fontsize=11, fontweight='bold', color='#4c566a',
-                ha='center', va='top')
+        patch_h = 0.55 / num_labels if num_labels > 8 else 0.035
 
         self._radio_circles = []
-        self._color_patches.clear()
 
         for i in range(num_labels):
-            y = self._radio_ys[i]
+            y = ys[i]
 
-            # 方框 — checkbox 风格
-            c = Rectangle(
-                (0.06, y - dot_radius), dot_radius * 2, dot_radius * 2,
+            c = Circle(
+                (0.07, y), dot_radius,
                 transform=ax.transAxes,
                 facecolor='white',
-                edgecolor='#a0a8b8',
-                linewidth=1.8,
+                edgecolor='black',
+                linewidth=2.0,
                 zorder=10,
             )
             ax.add_patch(c)
             self._radio_circles.append(c)
 
-            # 曲线名称
             ax.text(
                 0.42, y, base_labels[i],
                 transform=ax.transAxes,
                 fontsize=font_size,
-                fontweight='bold' if i == 0 else 'normal',
-                color='#4c566a',
                 va='center',
             )
 
             if i == 0:
                 continue
 
-            # 色块
             rect = Rectangle(
-                (0.18, y - patch_h / 2), 0.20, patch_h,
+                (0.17, y - patch_h / 2), 0.22, patch_h,
                 facecolor=curve_colors[i - 1],
                 transform=ax.transAxes,
                 zorder=0,
-                edgecolor='#d8dee9',
-                linewidth=0.8,
-                alpha=0.85,
+                edgecolor='#aaaaaa',
+                linewidth=0.5,
             )
             ax.add_patch(rect)
             self._color_patches.append(rect)
 
-        self.radio_labels = base_labels
-        self._refresh_radio_panel()
+        def _refresh_dots():
+            for i, c in enumerate(self._radio_circles):
+                c.set_facecolor(activecolor if i == active_idx[0] else 'white')
+
+        _refresh_dots()
 
         def _on_radio_click(event):
             if event.inaxes != ax or event.button != 1:
                 return
-            if event.ydata is None or not hasattr(self, '_radio_ys'):
+            if event.ydata is None:
                 return
-            dists = np.abs(self._radio_ys - event.ydata)
+            dists = np.abs(ys - event.ydata)
             closest = int(np.argmin(dists))
             if dists[closest] < 0.8 / num_labels:
-                # 双击 → toggle 锁定；单击 → 单选替换
-                if event.dblclick:
-                    self.toggle_active_curve(self._radio_labels[closest])
-                else:
-                    self.set_active_curve(self._radio_labels[closest])
+                active_idx[0] = closest
+                _refresh_dots()
+                self.fig.canvas.draw_idle()
+                self.set_active_curve(base_labels[closest])
 
         self.fig.canvas.mpl_connect('button_press_event', _on_radio_click)
 
-    def _refresh_radio_panel(self):
-        """更新 checkbox 状态：实心=单击选中，边框加粗+对勾=双击锁定"""
-        if not hasattr(self, '_radio_circles') or not self._radio_circles:
-            return
-        effective = self._get_effective_active()
-        is_all = len(effective) == 0
-        for i, c in enumerate(self._radio_circles):
-            if i == 0:
-                checked = is_all
-                locked = False
-            else:
-                checked = (i - 1) in self.active_curve_indices
-                locked = (i - 1) in self.locked_curve_indices
-            if locked:
-                c.set_facecolor(self._radio_colors[i])
-                c.set_edgecolor('#d5300b')
-                c.set_linewidth(3.0)
-            elif checked:
-                c.set_facecolor(self._radio_colors[i])
-                c.set_edgecolor('#4c6f99')
-                c.set_linewidth(2.2)
-            else:
-                c.set_facecolor('white')
-                c.set_edgecolor('#a0a8b8')
-                c.set_linewidth(1.8)
-        self.fig.canvas.draw_idle()
+        class _RadioCompat:
+            labels = base_labels
+
+            @staticmethod
+            def set_active(idx):
+                active_idx[0] = idx
+                _refresh_dots()
+                self.fig.canvas.draw_idle()
+
+            @staticmethod
+            def on_clicked(_cb):
+                pass
+
+        self.radio_menu = _RadioCompat()
+        self.radio_labels = base_labels
 
     # ===================== 拖拽支持 =====================
 
@@ -849,8 +780,7 @@ class HarmoniousCurvesEditor:
                 '拖放 CSV / Excel / NPY 文件到此处\n或点击 Open 按钮选择文件',
                 transform=self.ax.transAxes,
                 ha='center', va='center',
-                fontsize=15, color='#4c566a', alpha=0.30,
-                fontweight='bold',
+                fontsize=16, color='gray', alpha=0.35,
                 zorder=100,
             )
         else:
@@ -987,9 +917,8 @@ class HarmoniousCurvesEditor:
             return
         if self._batch_moving and self._batch_origin is not None:
             dy = event.ydata - self._batch_origin[1]
-            effective = self._get_effective_active()
             for c_idx, p_idx in self._selected_points:
-                if len(effective) == 0 or c_idx in effective:
+                if self.active_curve_idx is None or c_idx == self.active_curve_idx:
                     self.curves[c_idx]['y'][p_idx] += dy
             affected = set(c for c, _ in self._selected_points)
             for c in affected:
@@ -1049,35 +978,35 @@ class HarmoniousCurvesEditor:
         if not self.curves or event.xdata is None or event.ydata is None:
             return None, None
         mouse_xy = self.ax.transData.transform((event.xdata, event.ydata))
-        effective = self._get_effective_active()
-        if len(effective) > 0:
-            candidates = sorted(effective)
-        else:
-            candidates = list(range(len(self.curves)))
-        min_dist = float('inf')
-        closest_curve, closest_point = None, None
-        for c_idx in candidates:
+        if self.active_curve_idx is not None:
+            c_idx = self.active_curve_idx
             curve = self.curves[c_idx]
             x, y = curve['x'], curve['y']
             pts_xy = self.ax.transData.transform(np.c_[x, y])
             distances = np.linalg.norm(pts_xy - mouse_xy, axis=1)
             p_idx = np.argmin(distances)
-            if distances[p_idx] < min_dist:
-                min_dist = distances[p_idx]
-                closest_curve, closest_point = c_idx, p_idx
-        if min_dist < self._epsilon:
-            return closest_curve, closest_point
+            if distances[p_idx] < self._epsilon:
+                return c_idx, p_idx
+        else:
+            min_dist = float('inf')
+            closest_curve, closest_point = None, None
+            for c_idx, curve in enumerate(self.curves):
+                x, y = curve['x'], curve['y']
+                pts_xy = self.ax.transData.transform(np.c_[x, y])
+                distances = np.linalg.norm(pts_xy - mouse_xy, axis=1)
+                p_idx = np.argmin(distances)
+                if distances[p_idx] < min_dist:
+                    min_dist = distances[p_idx]
+                    closest_curve, closest_point = c_idx, p_idx
+            if min_dist < self._epsilon:
+                return closest_curve, closest_point
         return None, None
 
     def _select_points_in_rect(self, x0, y0, x1, y1):
         selected = []
         xmin, xmax = min(x0, x1), max(x0, x1)
         ymin, ymax = min(y0, y1), max(y0, y1)
-        effective = self._get_effective_active()
-        if len(effective) > 0:
-            curves_to_check = [(i, self.curves[i]) for i in sorted(effective)]
-        else:
-            curves_to_check = list(enumerate(self.curves))
+        curves_to_check = [(self.active_curve_idx, self.curves[self.active_curve_idx])] if self.active_curve_idx is not None else enumerate(self.curves)
         for c_idx, curve in curves_to_check:
             xs, ys = curve['x'], curve['y']
             for p_idx, (px, py) in enumerate(zip(xs, ys)):
@@ -1130,15 +1059,16 @@ class HarmoniousCurvesEditor:
                 self._delete_selected_points()
         elif event.key == 'a':
             self._tab_index = 0
+            if self.radio_menu and self.radio_labels:
+                self.radio_menu.set_active(0)
             self.set_active_curve("All")
         elif event.key == 'tab':
-            if not self.radio_labels or len(self.curves) == 0:
+            if not self.radio_labels:
                 return
-            self._tab_index = (self._tab_index + 1) % (len(self.curves) + 1)
-            if self._tab_index == 0:
-                self.set_active_curve("All")
-            else:
-                self.set_active_curve(self.curves[self._tab_index - 1]['name'])
+            self._tab_index = (self._tab_index + 1) % len(self.radio_labels)
+            if self.radio_menu:
+                self.radio_menu.set_active(self._tab_index)
+            self.set_active_curve(self.radio_labels[self._tab_index])
 
     def save_curves_npy(self, event=None, filename="adjusted_curves.npy"):
         if not self.curves:
@@ -1166,15 +1096,13 @@ class HarmoniousCurvesEditor:
             self.slider_noise.eventson = True
 
     def _get_target_points_map(self):
-        effective = self._get_effective_active()
         targets = {}
         if self._selected_points:
             for c_idx, p_idx in self._selected_points:
-                if len(effective) == 0 or c_idx in effective:
+                if self.active_curve_idx is None or c_idx == self.active_curve_idx:
                     targets.setdefault(c_idx, []).append(p_idx)
-        elif len(effective) > 0:
-            for c_idx in sorted(effective):
-                targets[c_idx] = list(range(len(self.curves[c_idx]['y'])))
+        elif self.active_curve_idx is not None:
+            targets[self.active_curve_idx] = list(range(len(self.curves[self.active_curve_idx]['y'])))
         else:
             for c_idx in range(len(self.curves)):
                 targets[c_idx] = list(range(len(self.curves[c_idx]['y'])))
@@ -1233,106 +1161,48 @@ def _make_demo_curves(n_pts=80):
 # ===================== UI 工厂 =====================
 def _build_ui():
     """创建 figure 和所有 axes，返回 (fig, axes_dict)"""
-    # ── 现代柔和配色 ──
-    BG_FIGURE  = '#eceff4'   # 整体背景
-    BG_PLOT    = '#ffffff'   # 主绘图区
-    GRID_COLOR = '#d8dee9'   # 网格线
-    BG_SLIDER  = '#e5e9f0'   # 滑杆轨道底色
-    BG_RADIO   = '#fafbfc'   # 单选面板
-    BG_INPUT   = '#f4f5f8'   # 输入框底色
-
     fig = plt.figure(figsize=(16, 9))
-    fig.patch.set_facecolor(BG_FIGURE)
     fig.canvas.manager.set_window_title("CurveMagician")
 
     ax = {
-        'main':     plt.axes([0.05, 0.10, 0.70, 0.80], facecolor=BG_PLOT),
-        # 左侧操作按钮组：Open | Save | Undo | Fit
+        'main':     plt.axes([0.05, 0.10, 0.70, 0.80]),
         'open':     plt.axes([0.05, 0.94, 0.08, 0.035]),
         'save':     plt.axes([0.14, 0.94, 0.08, 0.035]),
         'undo':     plt.axes([0.23, 0.94, 0.08, 0.035]),
-        'fit':      plt.axes([0.32, 0.94, 0.06, 0.035]),
-        # 右侧参数组：+/-N | Points | Resample
-        'neighbor': plt.axes([0.52, 0.94, 0.08, 0.035], facecolor=BG_INPUT),
-        'npts':     plt.axes([0.61, 0.94, 0.07, 0.035], facecolor=BG_INPUT),
-        'apply':    plt.axes([0.69, 0.94, 0.08, 0.035]),
-        'scale':    plt.axes([0.80, 0.89, 0.18, 0.040], facecolor=BG_SLIDER),
-        'smooth':   plt.axes([0.80, 0.84, 0.18, 0.040], facecolor=BG_SLIDER),
-        'noise':    plt.axes([0.80, 0.79, 0.18, 0.040], facecolor=BG_SLIDER),
-        'radio':    plt.axes([0.78, 0.08, 0.20, 0.68], facecolor=BG_RADIO),
+        'neighbor': plt.axes([0.35, 0.94, 0.11, 0.035]),
+        'fit':      plt.axes([0.47, 0.94, 0.06, 0.035]),
+        'npts':     plt.axes([0.57, 0.94, 0.07, 0.035]),
+        'apply':    plt.axes([0.65, 0.94, 0.08, 0.035]),
+        'scale':    plt.axes([0.80, 0.89, 0.18, 0.040], facecolor='#e0e0e0'),
+        'smooth':   plt.axes([0.80, 0.84, 0.18, 0.040], facecolor='#e0e0e0'),
+        'noise':    plt.axes([0.80, 0.79, 0.18, 0.040], facecolor='#e0e0e0'),
+        'radio':    plt.axes([0.78, 0.08, 0.20, 0.68], facecolor='#fbfbfb'),
     }
-
-    # ── 主绘图区美化 ──
-    main_ax = ax['main']
-    main_ax.grid(True, linestyle='-', alpha=0.25, color=GRID_COLOR, linewidth=0.6)
-    main_ax.tick_params(labelsize=9, colors='#4c566a')
-    main_ax.spines['top'].set_visible(False)
-    main_ax.spines['right'].set_visible(False)
-    main_ax.spines['left'].set_color('#d8dee9')
-    main_ax.spines['bottom'].set_color('#d8dee9')
-
-    # ── 其他小 axes 统一隐藏边框 ──
-    for key in ['open', 'save', 'undo', 'fit', 'apply', 'neighbor', 'npts']:
-        _hide_axes_spines(ax[key])
-
+    ax['main'].grid(True, linestyle='--', alpha=0.45)
     return fig, ax
-
-
-def _hide_axes_spines(axes):
-    """隐藏 axes 的四个边框和刻度"""
-    for spine in axes.spines.values():
-        spine.set_visible(False)
-    axes.set_xticks([])
-    axes.set_yticks([])
 
 
 def _wire_widgets(editor, ax):
     """创建按钮/滑杆/输入框并连接到编辑器"""
-    # ── 按钮配色（Nord 风格） ──
-    C_OPEN   = '#5e81ac'  # 钢蓝
-    C_SAVE   = '#a3be8c'  # 鼠尾草绿
-    C_UNDO   = '#d08770'  # 暖橙
-    C_FIT    = '#b48ead'  # 淡紫
-    C_APPLY  = '#bf616a'  # 珊瑚红
-    C_OPEN_H   = '#4c6f99'
-    C_SAVE_H   = '#8caa72'
-    C_UNDO_H   = '#c0745d'
-    C_FIT_H    = '#a07a99'
-    C_APPLY_H  = '#ad5058'
-
-    # 左侧操作按钮组
-    Button(ax['open'],  'Open',  color=C_OPEN,  hovercolor=C_OPEN_H).on_clicked(editor.on_open_clicked)
-    Button(ax['save'],  'Save',  color=C_SAVE,  hovercolor=C_SAVE_H).on_clicked(editor.save_file)
-    Button(ax['undo'],  'Undo',  color=C_UNDO,  hovercolor=C_UNDO_H).on_clicked(editor.undo)
-    Button(ax['fit'],   'Fit',   color=C_FIT,   hovercolor=C_FIT_H).on_clicked(editor._auto_range_axes)
-
-    # 右侧参数组
     TextBox(ax['neighbor'], "+/-N", initial="0").on_submit(editor.set_neighbor_num)
 
     resample_box = TextBox(ax['npts'], "", initial="")
     editor._resample_box = resample_box
     editor._typing_axes.add(ax['npts'])
-    Button(ax['apply'], 'Resample', color=C_APPLY, hovercolor=C_APPLY_H).on_clicked(editor._do_resample)
+    Button(ax['apply'], 'Resample').on_clicked(editor._do_resample)
 
-    # ── 滑杆 ──
-    SLIDER_COLOR = '#5e81ac'
+    Button(ax['open'], 'Open').on_clicked(editor.on_open_clicked)
+    Button(ax['save'], 'Save').on_clicked(editor.save_file)
+    Button(ax['undo'], 'Undo').on_clicked(editor.undo)
+    Button(ax['fit'], 'Fit').on_clicked(editor._auto_range_axes)
+
     sliders = {
-        'scale':  Slider(ax['scale'],  'Scale ',  0.0, 2.0, valinit=1.0, valfmt='%.2f', color=SLIDER_COLOR),
-        'smooth': Slider(ax['smooth'], 'Smooth',  1,   15,  valinit=1,   valfmt='%d',   color=SLIDER_COLOR),
-        'noise':  Slider(ax['noise'],  'Noise ',  0.0, 5.0, valinit=0.0, valfmt='%.1f', color=SLIDER_COLOR),
+        'scale':  Slider(ax['scale'],  'Scale ',  0.0, 2.0, valinit=1.0, valfmt='%.2f', color='#4682b4'),
+        'smooth': Slider(ax['smooth'], 'Smooth',  1,   15,  valinit=1,   valfmt='%d',   color='#4682b4'),
+        'noise':  Slider(ax['noise'],  'Noise ',  0.0, 5.0, valinit=0.0, valfmt='%.1f', color='#4682b4'),
     }
     for s in sliders.values():
-        s.label.set_size(10)
-        s.label.set_color('#4c566a')
-        s.label.set_fontweight('bold')
-        s.valtext.set_fontsize(9)
-        s.valtext.set_color('#4c566a')
-        # 滑杆手柄（poly）美化
-        if hasattr(s, 'poly'):
-            s.poly.set_facecolor('#81a1c1')
-            s.poly.set_edgecolor('#5e81ac')
-            s.poly.set_linewidth(1.2)
-
+        s.label.set_size(9)
     editor.slider_scale  = sliders['scale']
     editor.slider_smooth = sliders['smooth']
     editor.slider_noise  = sliders['noise']
@@ -1356,9 +1226,9 @@ def _load_demo(editor, colors):
 
 # ===================== 主程序 =====================
 if __name__ == "__main__":
-    COLORS = ['#5e81ac', '#d08770', '#a3be8c', '#b48ead', '#bf616a',
-              '#ebcb8b', '#81a1c1', '#8fbcbb', '#c9826b', '#7e9e6d',
-              '#6a89cc', '#e55039', '#78e08f', '#6a89cc', '#b8e994']
+    COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+              '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+              '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5']
 
     fig, ax = _build_ui()
     editor = HarmoniousCurvesEditor(
