@@ -1181,11 +1181,6 @@ class HarmoniousCurvesEditor:
         dot_radius = 0.028 if num_labels > 8 else 0.035
         patch_h = 0.55 / num_labels if num_labels > 8 else 0.038
 
-        # ── 面板标题 ──
-        ax.text(0.50, 0.97, 'Curves', transform=ax.transAxes,
-                fontsize=11, fontweight='bold', color='#2d3436',
-                ha='center', va='top')
-
         self._radio_circles = []
         self._lock_icons = []
         self._color_patches.clear()
@@ -1282,15 +1277,10 @@ class HarmoniousCurvesEditor:
                 pinned = (i - 1) in self.pinned_curve_indices
             if pinned or locked or checked:
                 c.set_facecolor(self._radio_colors[i])
-                c.set_linewidth(2.5)
-                if pinned or locked:
-                    c.set_edgecolor('#555')     # 统一暗边框
-                else:
-                    c.set_edgecolor('#1e6fc0')
             else:
                 c.set_facecolor('white')
-                c.set_edgecolor('#9098a8')
-                c.set_linewidth(2.0)
+            c.set_edgecolor('#9098a8')
+            c.set_linewidth(2.0)
 
         # 更新图标 — 🔒 = 锁定  📌 = 固定
         for i, icon in enumerate(self._lock_icons):
