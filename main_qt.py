@@ -1191,7 +1191,6 @@ class HarmoniousCurvesEditor:
             self.add_curve(np.arange(len(y_arr)), y_arr, color=color, name=name)
 
         self._build_radio_panel(curve_colors)
-        self._auto_range_axes()
         self._save_current_state()
         self._reset_slider_widgets()
         self._hide_drop_hint()
@@ -1689,7 +1688,6 @@ class HarmoniousCurvesEditor:
         if need_save:
             self._save_current_state()
             self._reset_slider_widgets()
-            self._expand_axes_if_needed()
 
         self._update_selection_info()
 
@@ -1890,7 +1888,6 @@ class HarmoniousCurvesEditor:
             self.curves[c_idx]['y'][:] = orig_y
             self._update_spline(c_idx)
 
-        self._expand_axes_if_needed()
         self._refresh_visual_style()
         self._update_selection_info()
 
@@ -2029,7 +2026,6 @@ def _load_demo(editor, colors):
                          color=colors[idx % len(colors)], name=f"Curve {idx}")
     editor._build_radio_panel(
         [colors[i % len(colors)] for i in range(data.shape[1])])
-    editor._auto_range_axes()
     editor._save_current_state()
     editor._reset_slider_widgets()
     editor._update_selection_info()
