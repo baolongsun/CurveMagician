@@ -7,7 +7,7 @@ from os.path import splitext, basename
 from time import perf_counter
 from matplotlib.patches import Rectangle, Circle
 from matplotlib.widgets import AxesWidget, Button, TextBox, Slider
-from scipy.interpolate import splprep, splev, CubicSpline
+from scipy.interpolate import splprep, splev
 from scipy.ndimage import uniform_filter1d
 from tkinter import filedialog, messagebox
 
@@ -95,6 +95,7 @@ class HarmoniousCurvesEditor:
         self._shift_selecting = False
         self._handle_radius = 8         # 手柄命中半径（像素）
         self._last_motion_time = 0      # motion 节流计时器（秒）
+        self._clipboard = None          # Ctrl+C/V: {'curve_idx': int, 'y_values': [...]}
 
         # 性能：motion 事件节流
         self._last_motion_time = 0      # 上次处理 motion 的时间（秒）
@@ -724,6 +725,161 @@ class HarmoniousCurvesEditor:
         """核心业务功能：将选中曲线的局部控制点，平滑增点/降点重采样为 Y 个点"""
         if not hasattr(self, '_resample_box') or not self._resample_box:
             return
+
+        try:
+            n_new = int(self._resample_box.text)
+        except ValueError:
+            messagebox.showwarning("输入错误", "请输入有效的段内目标点数整数（如 10）")
+            return
+        if n_new < 4:
+            messagebox.showwarning("约束错误", "局部段重采样后至少需要保留 4 个控制点以维持三次样条拟合")
+            return
+
+        effective = self._get_effective_active()
+        by_curve = {}
+        if self._selected_points:
+            for c, p in self._selected_points:
+                if len(effective) == 0 or c in effective:
+                    by_curve.setdefault(c, []).append(p)
+        else:
+            targets = sorted(effective) if len(effective) > 0 else list(range(len(self.curves)))
+            for c in targets:
+                by_curve[c] = list(range(len(self.curves[c]['y'])))
+
+        if not by_curve:
+            print("当前未选中任何有效曲线或控制点")
+            return
+
+        counts = {len(p_idxs) for p_idxs in by_curve.values()}
+        if len(counts) > 1:
+            messagebox.showerror("重采样失败", f"强约束未满足！当前框选的各曲线内部点数不一致: {counts}，无法批量重采样。")
+            return
+
+        modified_any = False
+
+        for c_idx, p_idxs in by_curve.items():
+            curve = self.curves[c_idx]
+            orig_y = curve['y']
+            total_pts = len(orig_y)
+
+            i_min, i_max = min(p_idxs), max(p_idxs)
+            n_old = i_max - i_min + 1
+
+            if n_old == n_new and self._selected_points:
+                continue
+
+            pad = 2
+            ext_min = max(0, i_min - pad)
+            ext_max = min(total_pts - 1, i_max + pad)
+
+            seg_y = orig_y[ext_min:ext_max + 1]
+            seg_x = np.arange(len(seg_y), dtype=float)
+
+            k_order = 3 if len(seg_y) > 3 else (len(seg_y) - 1)
+            if k_order < 1:
+                continue
+
+            tck, u = splprep([seg_x, seg_y], s=0, k=k_order)
+
+            left_pad_count = i_min - ext_min
+            right_pad_count = ext_max - i_max
+            total_seg_new_count = left_pad_count + n_new + right_pad_count
+
+            u_new = np.linspace(0, 1, total_seg_new_count)
+            _, y_resampled_ext = splev(u_new, tck)
+
+            start_idx = left_pad_count
+            end_idx = total_seg_new_count - right_pad_count
+            y_resampled_core = y_resampled_ext[start_idx:end_idx]
+
+            y_new = np.concatenate([
+                orig_y[:i_min],
+                y_resampled_core,
+                orig_y[i_max + 1:]
+            ])
+
+            curve['x'] = np.arange(len(y_new), dtype=float)
+            curve['y'] = y_new
+            self._update_spline(c_idx)
+            modified_any = True
+
+        if modified_any:
+            self._save_current_state()
+            print(f"成功！已将各曲线选中段的控制点平滑转换为了 {n_new} 个点。")
+
+        self._clear_selection()
+
+    # ===================== C / V 复制粘贴 =====================
+
+    def _copy_selected(self):
+        """C: 复制选中控制点的 Y 值（限单条曲线）"""
+        if not self._selected_points:
+            return
+
+        # 必须所有选中点属于同一条曲线
+        curves = {c for c, _ in self._selected_points}
+        if len(curves) != 1:
+            print("  ⚠ 复制仅支持单条曲线，当前选中跨多条曲线")
+            return
+
+        c_idx = curves.pop()
+        if c_idx in self.pinned_curve_indices:
+            return
+
+        # 按点索引升序提取 Y 值
+        sorted_pts = sorted(p for c, p in self._selected_points if c == c_idx)
+        y_vals = [self.curves[c_idx]['y'][p] for p in sorted_pts]
+
+        self._clipboard = {'curve_idx': c_idx, 'y_values': y_vals}
+        print(f"  📋 已复制 {self.curves[c_idx]['name']} 的 {len(y_vals)} 个点")
+
+    def _paste_to_curve(self):
+        """Ctrl+V: 粘贴到当前活跃曲线（或原曲线）最后选中点之后"""
+        if self._clipboard is None:
+            return
+
+        y_vals = self._clipboard['y_values']
+
+        # 目标曲线：当前活跃的单条曲线优先；否则用复制来源曲线
+        effective = self._get_effective_active()
+        if len(effective) == 1:
+            c_idx = next(iter(effective))
+        else:
+            c_idx = self._clipboard['curve_idx']
+
+        if c_idx >= len(self.curves) or c_idx in self.pinned_curve_indices:
+            return
+
+        curve = self.curves[c_idx]
+
+        # 确定插入位置：当前选中点中属于目标曲线的最大索引 + 1；否则末尾
+        same_curve_pts = [p for c, p in self._selected_points if c == c_idx]
+        if same_curve_pts:
+            insert_at = max(same_curve_pts) + 1
+        else:
+            insert_at = len(curve['y'])
+
+        # 插入
+        new_y = np.insert(curve['y'], insert_at, y_vals)
+        curve['y'] = new_y
+        curve['x'] = np.arange(len(new_y), dtype=float)
+        self._update_spline(c_idx)
+        self._save_current_state()
+
+        # 更新选中：清除旧选区，选中新插入的点
+        new_selected = [(c_idx, insert_at + i) for i in range(len(y_vals))]
+        self._selected_points = new_selected
+        self._refresh_visual_style()
+        self._update_selection_info()
+
+        from_curve = self.curves[self._clipboard['curve_idx']]['name']
+        if c_idx != self._clipboard['curve_idx']:
+            print(f"  📋 已粘贴 {len(y_vals)} 个点: {from_curve} → {curve['name']} [{insert_at}]")
+        else:
+            print(f"  📋 已粘贴 {len(y_vals)} 个点到 {curve['name']} [{insert_at}]")
+        """核心业务功能：将选中曲线的局部控制点，平滑增点/降点重采样为 Y 个点"""
+        if not hasattr(self, '_resample_box') or not self._resample_box:
+            return
         
         try:
             n_new = int(self._resample_box.text)
@@ -885,6 +1041,7 @@ class HarmoniousCurvesEditor:
         self.canvas.draw_idle()
 
     def _expand_axes_if_needed(self):
+        """仅在拖拽点超出当前 Y 轴范围时才扩，不超出则完全不改视图"""
         if not self.curves:
             return
         all_y = np.concatenate([c['y'] for c in self.curves])
@@ -894,20 +1051,13 @@ class HarmoniousCurvesEditor:
         y_min, y_max = np.min(all_y), np.max(all_y)
         cur_ylo, cur_yhi = self.ax.get_ylim()
 
-        y_range = y_max - y_min or 1.0
-        margin = 0.10
-
         new_lo, new_hi = cur_ylo, cur_yhi
-        changed = False
-
         if y_min < cur_ylo:
-            new_lo = y_min - y_range * margin
-            changed = True
+            new_lo = y_min
         if y_max > cur_yhi:
-            new_hi = y_max + y_range * margin
-            changed = True
+            new_hi = y_max
 
-        if changed:
+        if new_lo != cur_ylo or new_hi != cur_yhi:
             self.ax.set_ylim(new_lo, new_hi)
             self.canvas.draw_idle()
 
@@ -1360,13 +1510,10 @@ class HarmoniousCurvesEditor:
     def _update_spline(self, curve_idx):
         curve = self.curves[curve_idx]
         x, y = curve['x'], curve['y']
-        tck, u = splprep([x, y], s=0, k=3)
-        u_fine = np.linspace(0, 1, 300)
-        x_fine, y_fine = splev(u_fine, tck)
         curve['ctrl_points'].set_data(x, y)
-        curve['spline_line'].set_data(x_fine, y_fine)
-        curve['fine_x_full'] = x_fine
-        curve['fine_y_full'] = y_fine
+        curve['spline_line'].set_data(x, y)
+        curve['fine_x_full'] = x
+        curve['fine_y_full'] = y
 
     def on_press(self, event):
         if self._is_toolbar_active():
@@ -1635,7 +1782,11 @@ class HarmoniousCurvesEditor:
             # adjust 模式下屏蔽其他按键
             return
 
-        if event.key == 's':
+        if event.key in ('c', 'ctrl+c'):
+            self._copy_selected()
+        elif event.key in ('v', 'ctrl+v'):
+            self._paste_to_curve()
+        elif event.key == 's':
             self.save_file()
         elif event.key == 'o':
             self.on_open_clicked()
@@ -1733,7 +1884,7 @@ class HarmoniousCurvesEditor:
                 if data_range == 0: data_range = 1.0
 
                 rng = np.random.RandomState(self._noise_seed or 0)
-                noise = rng.normal(0, data_range * 0.05 * noise_coeff, size=len(p_idxs))
+                noise = rng.normal(0, data_range * 0.012 * noise_coeff, size=len(p_idxs))
                 orig_y[p_idxs] += noise
 
             self.curves[c_idx]['y'][:] = orig_y
